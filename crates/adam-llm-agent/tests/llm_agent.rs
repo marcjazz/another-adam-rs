@@ -3507,3 +3507,196 @@ async fn a_detached_context_reports_its_steps_to_the_sink() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// The backstop on a tool result (ADR 0044, decision 2)
+// ---------------------------------------------------------------------------
+
+/// Answers `size` bytes. It says it `paged` (the declaration the loop goes by) or not; its schema
+/// has an `offset` when `schema_offset`, whatever it declares.
+struct Bulky {
+    size: usize,
+    paged: bool,
+    schema_offset: bool,
+}
+
+#[async_trait]
+impl Tool for Bulky {
+    fn spec(&self) -> ToolSpec {
+        let properties = if self.schema_offset {
+            json!({"offset": {"type": "integer"}})
+        } else {
+            json!({})
+        };
+        ToolSpec {
+            name: "bulky".into(),
+            description: "bulky".into(),
+            parameters: json!({"type": "object", "properties": properties}),
+        }
+    }
+    fn paged(&self) -> bool {
+        self.paged
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("é".repeat(self.size / 2)))
+    }
+}
+
+/// What the model was sent for the one call of a run, and what the history holds.
+async fn tool_result_of(paged: bool) -> (String, String) {
+    tool_result_of_tool(Bulky {
+        size: 800_000,
+        paged,
+        schema_offset: paged,
+    })
+    .await
+}
+
+async fn tool_result_of_tool(tool: impl Tool) -> (String, String) {
+    let h = Harness::new();
+    let name = tool.spec().name;
+    let agent = h.agent().tool(tool).build();
+    h.mock
+        .push_tool_calls(vec![call("c1", &name, json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let sent = h.mock.requests()[1].messages[2].text();
+    let kept = conversation(&view).messages[2].text();
+    (sent, kept)
+}
+
+#[tokio::test]
+async fn a_tool_result_over_64_kib_is_cut_with_a_marker_before_history() {
+    let (sent, kept) = tool_result_of(false).await;
+    assert_eq!(sent, kept, "the history holds what the model is sent");
+    assert!(sent.len() < 65 * 1024, "{}", sent.len());
+    assert!(
+        sent.ends_with("\n[cut by the loop: 65536 of 800000 bytes shown]"),
+        "{}",
+        &sent[sent.len() - 80..]
+    );
+}
+
+#[tokio::test]
+async fn the_marker_names_offset_only_for_a_paged_tool() {
+    let (paged, _) = tool_result_of(true).await;
+    assert!(
+        paged.ends_with(
+            "[cut by the loop: 65536 of 800000 bytes shown. Call bulky again with a later offset to read the rest]"
+        ),
+        "{}",
+        &paged[paged.len() - 120..]
+    );
+    let (plain, _) = tool_result_of(false).await;
+    assert!(!plain.contains("offset"), "{plain}");
+}
+
+/// An unrelated tool (an MCP tool, say) with an `offset` argument is not paged: its result is cut
+/// as any other, with no word about a later offset.
+#[tokio::test]
+async fn a_tool_with_an_offset_argument_is_not_paged_unless_it_says_so() {
+    let (sent, _) = tool_result_of_tool(Bulky {
+        size: 800_000,
+        paged: false,
+        schema_offset: true,
+    })
+    .await;
+    assert!(
+        sent.ends_with("[cut by the loop: 65536 of 800000 bytes shown]"),
+        "{}",
+        &sent[sent.len() - 80..]
+    );
+    assert!(!sent.contains("later offset"), "{sent}");
+}
+
+/// A tool that answers the biggest page the convention allows.
+struct BigPage;
+
+fn big_page() -> String {
+    let items: Vec<String> = (0..100)
+        .map(|i| format!("path/{i:03}:{i}:{}", "m".repeat(2000)))
+        .collect();
+    adam_llm_agent::paging::page_items(&items, 1, 100, "matches", "(none)", "matches", &[]).unwrap()
+}
+
+#[async_trait]
+impl Tool for BigPage {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "big_page".into(),
+            description: "a page".into(),
+            parameters: json!({"type": "object", "properties": {"offset": {"type": "integer"}}}),
+        }
+    }
+    fn paged(&self) -> bool {
+        true
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(big_page()))
+    }
+}
+
+/// A page the convention makes (100 matches of 2,000 characters, cut at the byte cap) reaches the
+/// model whole: the loop's backstop leaves it alone, and its final line is last.
+#[tokio::test]
+async fn a_paged_result_is_never_touched_by_the_backstop() {
+    let (sent, kept) = tool_result_of_tool(BigPage).await;
+    let page = big_page();
+    assert!(
+        page.len() > 40 * 1024,
+        "the page is a big one: {}",
+        page.len()
+    );
+    assert_eq!(sent, page);
+    assert_eq!(kept, page);
+    assert!(!sent.contains("[cut by the loop"));
+    assert!(sent.rsplit('\n').next().unwrap().starts_with("[more: "));
+}
+
+/// A worker dies while the second tool runs; the survivor replays the first tool's recorded
+/// result, and the cut it is given is the cut of a run that never crashed.
+#[tokio::test]
+async fn replay_gives_the_same_cut_bytes() {
+    let h = Harness::new();
+    let reached = Arc::new(Notify::new());
+    let agent = h
+        .agent()
+        .tool(Bulky {
+            size: 800_000,
+            paged: false,
+            schema_offset: false,
+        })
+        .tool(AsyncTool2 {
+            name: "b",
+            calls: Arc::new(AtomicUsize::new(0)),
+            first: Arc::new(AtomicBool::new(true)),
+            reached: reached.clone(),
+        })
+        .build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "bulky", json!({})),
+            call("c2", "b", json!({})),
+        ])
+        .push_text("both done");
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "crash-a", short_lease),
+        h.runtime_with(&agent, "crash-b", short_lease),
+    );
+    let run = rt_a.start("llm", user_message("go"), None).await.unwrap();
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "tool b starting").await;
+    doomed.handle.abort();
+    let _ = doomed.handle.await;
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+
+    let whole = "é".repeat(400_000);
+    let expected = adam_llm_agent::paging::backstop(&whole, "bulky", false);
+    assert_eq!(conversation(&view).messages[2].text(), expected.as_ref());
+}

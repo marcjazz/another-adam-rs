@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 22] = [
+const TOOLS: [&str; 25] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -31,6 +31,9 @@ const TOOLS: [&str; 22] = [
     "run_command",
     "run",
     "read_file",
+    "list_files",
+    "find_files",
+    "search_files",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -167,6 +170,26 @@ async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
     assert_eq!(adam_coder::tier::needs("delete_repository"), Bypass);
 }
 
+/// The loop pages by what a tool declares (`Tool::paged`), never by an `offset` in its schema: the
+/// four tools that read in pages declare it, and no other built-in tool does.
+#[tokio::test]
+async fn exactly_the_four_paged_tools_declare_that_they_page() {
+    let fx = Fixture::new().await.offering_creation();
+    for tool in coder_tools(&fx.env) {
+        let spec = tool.spec();
+        let paged =
+            ["read_file", "list_files", "find_files", "search_files"].contains(&spec.name.as_str());
+        assert_eq!(tool.paged(), paged, "{}", spec.name);
+        if paged {
+            assert!(
+                spec.parameters.pointer("/properties/offset").is_some(),
+                "{}",
+                spec.name
+            );
+        }
+    }
+}
+
 #[test]
 fn nullable_types_normalise_to_the_plain_type() {
     let mut schema = json!({
@@ -221,6 +244,14 @@ async fn only_the_optional_arguments_are_nullable() {
             "create_repository.private",
             "edit_file.replace_all",
             "edit_file.repo",
+            "find_files.limit",
+            "find_files.offset",
+            "find_files.path",
+            "find_files.repo",
+            "list_files.limit",
+            "list_files.offset",
+            "list_files.path",
+            "list_files.repo",
             "merge_pull_request.delete_branch",
             "merge_pull_request.method",
             "open_pull_request.accept_red_checks",
@@ -232,6 +263,8 @@ async fn only_the_optional_arguments_are_nullable() {
             "publish_scratch.path",
             "publish_scratch.scratch",
             "read_file.end_line",
+            "read_file.limit",
+            "read_file.offset",
             "read_file.repo",
             "read_file.start_line",
             "rebuild_environment.use_default",
@@ -241,6 +274,12 @@ async fn only_the_optional_arguments_are_nullable() {
             "run_checks.repo",
             "run_command.cwd",
             "run_command.repo",
+            "search_files.include",
+            "search_files.limit",
+            "search_files.literal",
+            "search_files.offset",
+            "search_files.path",
+            "search_files.repo",
             "share_file.name",
             "share_file.repo",
             "start_scratch.name",
