@@ -216,5 +216,29 @@ repository or scratch project in the run and nothing delivered it fails with
 form), redacted, whether or not changes are left in the worktree. When a run is cancelled while a command works, the tool
 kills the command and its process group and tells the run's environment which command to kill.
 
+### Time limit of each tool
+
+The agent stops a call that runs past its tool's limit (300 s for a tool that declares none) and tells the model it was
+stopped, so a tool with a bound of its own declares that bound and 30 s more, from the deployment's settings
+(`own_limit` in `bin/adam-coder/src/tools/mod.rs`); the table is held by `tests/time_limits.rs`, which walks the whole tool
+list and fails for a tool that has neither a limit nor a place on the `QUICK_TOOLS` list.
+
+| Tool | Limit |
+|---|---|
+| `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s |
+| `rebuild_environment` | making the environment ready + 30 s |
+| `read_file`, `list_files`, `find_files`, `search_files` | their own deadline, 30 s (`find::DEADLINE`) + 30 s |
+| `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | one network git operation (30 min) and the local ones around it (5 min) + 30 s |
+| the rest (`write_file`, `apply_patch`, `edit_file`, `share_file`, `start_scratch`, `request_repository`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `delete_repository`, `ask_user`, `show`, `ui_catalog`) | quick by construction: the default 300 s |
+
+The doom loop (a third call in a row of a tool with the same arguments) is refused when the two before gave the same
+result, were both error results, **or carried the same repeat key**. `run_command` and `run` return a failing command as normal text
+(`exit code N: FAILED` and the output tail), and the tail usually holds a duration or a temporary path, so no two failures
+are equal to the byte. The three command tools therefore attach a **repeat key** to a failure: `exit:<code>`, `timeout`
+or `signal` (the number of the signal is not known to the outcome); a command that passes carries none, so a poll that
+succeeds with a changing output keeps running. A model can still wait and retry by doing something else in between
+(`sleep`, a look at the logs): any other call resets the count. Nothing else sets a key; the command tools only set it, their
+text is unchanged.
+
 Where the workspace, the janitor and the environments are: [Workspace and environments](workspace-and-environments.md).
 Configuration: [Environment variables](environment.md).

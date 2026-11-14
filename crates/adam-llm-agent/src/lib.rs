@@ -158,7 +158,7 @@ pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND,
     OMITTED_MARKER_PREFIX, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, STOPPED_BY_THE_PERSON, user_message,
+    PendingWait, Repeats, STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -171,6 +171,9 @@ pub use source::{
 };
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
-pub use tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
+pub use tool::{
+    DEFAULT_TOOL_TIME_LIMIT, DynTool, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
+    ToolError, ToolOutput,
+};
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};

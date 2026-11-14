@@ -191,6 +191,12 @@ pub struct CoderSettings {
     /// [`DEFAULT_MAX`](crate::tier::DEFAULT_MAX), `auto`: renaming and deleting a repository are
     /// the deployment's opt-in.
     pub max_access_tier: AccessTier,
+    /// The longest `ToolEnv::session` can take to make the run's environment ready: nothing for the
+    /// coder's own container; for a devcontainer `DEVCONTAINER_UP_TIMEOUT_SECS` plus
+    /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`; for run pods `RUN_POD_WAIT_SECS` plus
+    /// `RUN_POD_READY_TIMEOUT_SECS`. The time limit of a tool that makes the environment is this and
+    /// whatever else it does.
+    pub environment_start: Duration,
 }
 
 impl Default for CoderSettings {
@@ -230,6 +236,7 @@ impl CoderSettings {
             create_repo_owners: Vec::new(),
             create_for_installed_owners: false,
             max_access_tier: crate::tier::DEFAULT_MAX,
+            environment_start: Duration::ZERO,
         }
     }
 }
@@ -829,6 +836,13 @@ impl Tool for Gated {
         self.inner.step_style()
     }
 
+    /// A tool that has a bound of its own declares that bound and half a minute more, so the
+    /// bound, which says what happened, fires first ([`own_limit`]); the agent's default applies
+    /// only to a tool with none, and every such tool is named in [`QUICK_TOOLS`].
+    fn time_limit(&self) -> Option<Duration> {
+        own_limit(&self.name, &self.env.settings).or_else(|| self.inner.time_limit())
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         // Every tier allows what needs the lowest one: no read of the notes for a look.
         if self.needs > AccessTier::Plan {
@@ -849,6 +863,60 @@ impl Tool for Gated {
         }
         self.inner.call(ctx, args).await
     }
+}
+
+/// What a tool's time limit adds to the bound it has of its own.
+const LIMIT_MARGIN: Duration = Duration::from_secs(30);
+
+/// The tools that **do not need a limit of their own**, because they are quick by construction: a
+/// file operation on the run's own directory, a request to the code host (its HTTP client gives up
+/// after 30 s), a question to the person (the call returns at once and the run parks), the catalog
+/// and display tools. Any other tool of the coder must have a bound of its own and declare it in
+/// `own_limit`: a tool added later is not on this list, so it decides. A test walks the whole tool
+/// list (`tests/time_limits.rs`).
+pub const QUICK_TOOLS: [&str; 13] = [
+    // The run's own files: `apply_patch` runs `git apply` for at most 60 s. (The four read tools,
+    // `read_file`, `list_files`, `find_files` and `search_files`, have a deadline of their own, 30 s:
+    // they declare it, see `own_limit`.)
+    "write_file",
+    "apply_patch",
+    "edit_file",
+    "share_file",
+    // A scratch directory and `git init` in it.
+    "start_scratch",
+    // The code host's API, 30 s per request, a few requests a call.
+    "request_repository",
+    "open_pull_request",
+    "merge_pull_request",
+    "rename_repository",
+    "delete_repository",
+    // The person's screen: the call returns at once.
+    "ask_user",
+    "show",
+    "ui_catalog",
+];
+
+/// The time limit a coder tool declares: its own bound and [`LIMIT_MARGIN`], from the deployment's
+/// configured values. `None` for a tool with no bound of its own (see [`QUICK_TOOLS`]).
+///
+/// | tool | its own bound |
+/// |---|---|
+/// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
+/// | `rebuild_environment` | the environment is made ready (`environment_start`) |
+/// | `read_file`, `list_files`, `find_files`, `search_files` | their own deadline (`find::DEADLINE`, 30 s) |
+/// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
+fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
+    let environment = settings.environment_start;
+    let bound = match name {
+        "run_command" | "run" | "run_checks" => environment + settings.check_timeout,
+        "rebuild_environment" => environment,
+        "read_file" | "list_files" | "find_files" | "search_files" => find::DEADLINE,
+        "prepare_workspace" | "commit_and_push" | "publish_scratch" | "create_repository" => {
+            adam_workspace::NETWORK_TIMEOUT + adam_workspace::LOCAL_TIMEOUT
+        }
+        _ => return None,
+    };
+    Some(bound + LIMIT_MARGIN)
 }
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].
@@ -889,6 +957,10 @@ impl Tool for Redacting {
 
     fn step_style(&self) -> StepStyle {
         self.inner.step_style()
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        self.inner.time_limit()
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

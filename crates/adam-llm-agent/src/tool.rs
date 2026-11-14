@@ -1,6 +1,7 @@
 //! The [`Tool`] trait and the values that flow through it.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
@@ -16,6 +17,13 @@ use serde_json::{Map, Value};
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
+
+/// The longest a call of a tool that declares no [`Tool::time_limit`] may run: 300 s.
+pub const DEFAULT_TOOL_TIME_LIMIT: Duration = Duration::from_secs(300);
+
+/// How long a call that is past its time limit has to stop by itself, once its
+/// [`ToolCtx::cancelled`] token has fired, before its future is dropped.
+pub const TOOL_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// A capability the model may call.
 ///
@@ -78,6 +86,20 @@ pub trait Tool: Send + Sync + 'static {
     /// not paged. `#[tool(paged)]` sets it. A tool that wraps another must forward it.
     fn paged(&self) -> bool {
         false
+    }
+
+    /// The longest one call of this tool may run. Past it the agent fires the call's
+    /// [`ToolCtx::cancelled`] token, gives the tool [`TOOL_STOP_GRACE`] to stop, drops it, and
+    /// answers the model with an error result that says the call did not finish (the result is
+    /// journaled, so a replay never waits). `None`, the default, is [`DEFAULT_TOOL_TIME_LIMIT`].
+    ///
+    /// Declare it when a call can reasonably take longer (a build, a deployment's command limit) or
+    /// must be quicker. A tool that waits on something else, a question or a child run, returns at
+    /// once and is not affected. A tool that wraps another (see
+    /// [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as it forwards
+    /// [`required_state`](Self::required_state).
+    fn time_limit(&self) -> Option<Duration> {
+        None
     }
 
     /// How a call of this tool is drawn as a step ([`RunEvent::Step`]): its kind, the label (the
@@ -217,6 +239,16 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox: SandboxUsage,
+    /// What the tool says makes two results of the same call **the same result for the
+    /// repeated-call rule** (`doom_loop`): two answers of one call (same tool, same arguments) that
+    /// carry the same key count as equal, whatever their text says. A command that fails the same way
+    /// twice prints a different duration or path each time, so its text never repeats to the byte; the
+    /// key (`exit:2`) does (boxed, so that a `Result<_, ToolOutput>` stays small). See [`with_repeat_key`](Self::with_repeat_key).
+    ///
+    /// Journaled with the result, so a replay decides the same; absent from a journal written before
+    /// it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_key: Option<Box<String>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -233,6 +265,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            repeat_key: None,
         }
     }
 
@@ -246,6 +279,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            repeat_key: None,
         }
     }
 
@@ -275,6 +309,17 @@ impl ToolOutput {
     pub fn final_answer(mut self, text: impl Into<String>) -> Self {
         self.answer = Some(text.into());
         self.ends_turn = true;
+        self
+    }
+
+    /// Say what makes this result the same as another of the same call for the repeated-call rule:
+    /// three calls in a row with the same tool and arguments are refused when the two before carried
+    /// the same key (or gave equal results, or both were errors). Set it only for a **failure** whose
+    /// text varies and whose cause does not (`exit:2`), never on a success: a poll that succeeds with
+    /// a changing text must keep running.
+    #[must_use]
+    pub fn with_repeat_key(mut self, key: impl Into<String>) -> Self {
+        self.repeat_key = Some(Box::new(key.into()));
         self
     }
 
@@ -661,6 +706,23 @@ impl ToolCtx {
     /// [`detached`](Self::detached), which belongs to no runtime; [`ToolError::Transient`] for a
     /// store failure worth retrying.
     pub async fn start_child(&self, agent: &str, message: &str) -> Result<RunId, ToolError> {
+        self.start_child_within(agent, message, None).await
+    }
+
+    /// [`start_child`](Self::start_child) for a child that must finish within `within` (`None`: no
+    /// limit). The runtime stores the deadline from its own clock; a child past it is failed with
+    /// `cancelled: time limit: the run did not finish within N min`, which the parent reads as the
+    /// child's error ("the run failed: ..."). See `Runtime::start_child_within`.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_child`](Self::start_child).
+    pub async fn start_child_within(
+        &self,
+        agent: &str,
+        message: &str,
+        within: Option<Duration>,
+    ) -> Result<RunId, ToolError> {
         let Some(children) = &self.children else {
             return Err(ToolError::Permanent(
                 "this tool context belongs to no runtime, so it cannot start a child run".into(),
@@ -695,7 +757,7 @@ impl ToolCtx {
             }
         }
         children
-            .start(child, agent, first)
+            .start_within(child, agent, first, within)
             .await
             .map_err(|e| ToolError::from_classified(&e))?;
         Ok(child)
@@ -854,6 +916,26 @@ mod tests {
 
     /// Journal entries as older builds wrote them, by hand: every shape that existed before
     /// `AwaitRun` still decodes to the same value.
+    #[test]
+    fn an_output_journaled_before_repeat_keys_decodes_and_a_key_round_trips() {
+        let old: ToolOutput =
+            serde_json::from_value(serde_json::json!({"content": "x", "is_error": false})).unwrap();
+        assert_eq!(old.repeat_key, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("repeat_key")
+                .is_none()
+        );
+        let keyed = ToolOutput::text("x").with_repeat_key("exit:2");
+        let back: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&keyed).unwrap()).unwrap();
+        assert_eq!(
+            back.repeat_key.as_deref().map(String::as_str),
+            Some("exit:2")
+        );
+    }
+
     #[test]
     fn journals_written_before_await_run_still_decode() {
         let old = [

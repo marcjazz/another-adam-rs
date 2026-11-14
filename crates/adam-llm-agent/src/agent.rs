@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, parse_context, parse_root_run, parse_root_step, parse_user_text,
+    PendingWait, Repeats, parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::paging::backstop;
@@ -32,7 +32,10 @@ use crate::source::{
 use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
-use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tool::{
+    DEFAULT_TOOL_TIME_LIMIT, DynTool, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
+    ToolError, ToolOutput,
+};
 use crate::toolset::ToolSet;
 
 /// What the run state says to the call it is about to run.
@@ -1205,6 +1208,60 @@ impl LlmAgent {
             if ctx.is_cancelled() {
                 return Ok(Flow::Fail(CANCELLED.into()));
             }
+            // `doom_loop`: the third call in a row with the same tool, the same arguments and the
+            // same result as the two before it does not run. Decided from the committed state alone.
+            let key = call_key(&call);
+            if let Some(repeats) = &mut state.repeats
+                && repeats.key == key
+                && (repeats.count >= DOOM_LOOP_AFTER
+                    || repeats.failing >= DOOM_LOOP_AFTER
+                    || repeats.marked >= DOOM_LOOP_AFTER)
+            {
+                repeats.refused += 1;
+                let ending = repeats.refused >= DOOM_LOOP_REFUSALS;
+                let said = repeated_call(&call.name);
+                let silent = silent_call(self, state, &call.name);
+                let style = self.style_of(&call.name, &state.source_notes);
+                say(
+                    ctx,
+                    silent,
+                    RunEvent::Step(style.event(&call.name, &call.id, StepState::Running)),
+                )
+                .await;
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&said, true)),
+                        &state.source_notes,
+                    ),
+                )
+                .await;
+                state
+                    .messages
+                    .push(Message::tool_error(call.id.clone(), said));
+                state.pending_calls.remove(0);
+                if ending {
+                    // The calls the turn still owed are answered too, so that no call is left without
+                    // a result; the next model call is the closing turn.
+                    for rest in std::mem::take(&mut state.pending_calls) {
+                        state.messages.push(Message::tool_error(
+                            rest.id,
+                            "not run: the run is ending because a call was repeated with the same result",
+                        ));
+                    }
+                    state.limit = Some(LimitHit {
+                        limit: LimitKind::RepeatedCall,
+                        answered: false,
+                        answer: None,
+                    });
+                    return Ok(Flow::Next);
+                }
+                continue;
+            }
             let used = files_kept(&state.artifacts);
             let (result, reported) = self
                 .run_tool(
@@ -1225,13 +1282,16 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    repeat_key,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
                     }
+                    record_answer(state, key, &message, repeat_key);
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
+                    state.repeats = None;
                     ctx.emit(RunEvent::Custom {
                         kind: "input_required".into(),
                         payload: json!({ "question": question, "call_id": call.id }),
@@ -1247,6 +1307,7 @@ impl LlmAgent {
                     return Ok(Flow::Park);
                 }
                 ToolResult::AwaitRun(run) => {
+                    state.repeats = None;
                     let wait = PendingRun {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
@@ -1283,6 +1344,7 @@ impl LlmAgent {
                     continue;
                 }
                 ToolResult::AwaitRemote { task, timeout_ms } => {
+                    state.repeats = None;
                     // The deadline is fixed now, from the journaled clock, so that every replay
                     // of this transition parks with the same one.
                     let deadline = match timeout_ms {
@@ -1371,6 +1433,7 @@ impl LlmAgent {
                 message: Message::tool_error(call.id.clone(), said),
                 artifacts: Vec::new(),
                 answer: None,
+                repeat_key: None,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1400,6 +1463,7 @@ impl LlmAgent {
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
                 let unjournaled = unjournaled.clone();
+                let name = call.name.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
                         && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
@@ -1409,7 +1473,12 @@ impl LlmAgent {
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
-                    with_reported_sandbox(&tool_ctx, &unjournaled, tool.call(&tool_ctx, args).await)
+                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
+                    let called = within(&tool_ctx, &name, limit, |ctx| async move {
+                        tool.call(&ctx, args).await
+                    })
+                    .await;
+                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
                 })
                 .await?
             }
@@ -1438,6 +1507,7 @@ impl LlmAgent {
                     message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
                     answer: None,
+                    repeat_key: None,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1445,6 +1515,11 @@ impl LlmAgent {
                 let sources = self.sources.clone();
                 let name = call.name.clone();
                 let unknown = self.unknown_tool(&call.name);
+                let source_limit = note
+                    .and_then(|n| n.timeout_ms)
+                    .map_or(DEFAULT_TOOL_TIME_LIMIT, |ms| {
+                        Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
+                    });
                 let unjournaled = unjournaled.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
@@ -1455,12 +1530,18 @@ impl LlmAgent {
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
-                    for source in &sources {
-                        if let Some(answer) = source.call(&tool_ctx, &name, args.clone()).await {
-                            return with_reported_sandbox(&tool_ctx, &unjournaled, answer);
+                    let tool_name = name.clone();
+                    let called = within(&tool_ctx, &name, source_limit, |ctx| async move {
+                        for source in &sources {
+                            if let Some(answer) = source.call(&ctx, &tool_name, args.clone()).await
+                            {
+                                return answer;
+                            }
                         }
-                    }
-                    Ok(ToolOutput::error(unknown))
+                        Ok(ToolOutput::error(unknown))
+                    })
+                    .await;
+                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
                 })
                 .await?
             }
@@ -1477,6 +1558,7 @@ impl LlmAgent {
         };
         let answered = match outcome {
             Ok(output) => {
+                let repeat_key = output.repeat_key.as_deref().cloned();
                 let (message, artifacts, answer, outcome) = output_message(
                     ctx,
                     &call.id,
@@ -1503,6 +1585,7 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    repeat_key,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1525,6 +1608,7 @@ impl LlmAgent {
                     ),
                     artifacts: Vec::new(),
                     answer: None,
+                    repeat_key: None,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -1675,6 +1759,9 @@ impl LlmAgent {
                 "turn limit exceeded: the model was called {} times (max_turns = {})",
                 state.turns, self.limits.max_turns
             ),
+            LimitKind::RepeatedCall => "the same tool call was repeated with the same result \
+                 and the run was stopped (doom_loop)"
+                .to_owned(),
         }
     }
 
@@ -2008,6 +2095,8 @@ enum ToolResult {
         artifacts: Vec<ArtifactRef>,
         /// What the tool announced as the run's answer, from a result that is not an error.
         answer: Option<Announcement>,
+        /// What the tool said makes this answer equal to another of the same call (`doom_loop`).
+        repeat_key: Option<String>,
     },
     NeedsInput {
         question: String,
@@ -2018,6 +2107,183 @@ enum ToolResult {
         task: String,
         timeout_ms: Option<u64>,
     },
+}
+
+/// What a source's call may run beyond the `timeout_ms` its listing gave the tool: the time the
+/// source itself needs to answer after its own limit.
+const SOURCE_LIMIT_MARGIN: Duration = Duration::from_secs(10);
+
+/// What the model is told when a call ran past its time limit.
+fn timed_out(tool: &str, limit: Duration) -> String {
+    format!(
+        "`{tool}` did not finish within {} and was stopped. What it had done is not undone: look \
+         at the state again before relying on it, and try a smaller step.",
+        if limit.subsec_nanos() == 0 {
+            format!("{} s", limit.as_secs())
+        } else {
+            format!("{} ms", limit.as_millis())
+        }
+    )
+}
+
+/// Run a call of a tool within `limit`. The call gets a token of its own, a child of the run's: when
+/// the limit passes the token fires, the tool has [`TOOL_STOP_GRACE`] to stop, and then its future
+/// is dropped. The answer is an error result, unless the tool finished with a real (not an error)
+/// result before that, at the instant of the limit or while it was told to stop. It runs inside the
+/// journaled step, so a replay reads the recorded answer and never waits, and no clock is read in a
+/// transition.
+async fn within<F, Fut>(
+    tool_ctx: &ToolCtx,
+    name: &str,
+    limit: Duration,
+    call: F,
+) -> Result<ToolOutput, ToolError>
+where
+    F: FnOnce(ToolCtx) -> Fut,
+    Fut: std::future::Future<Output = Result<ToolOutput, ToolError>>,
+{
+    let token = tool_ctx.cancel_token().child();
+    let fut = call(tool_ctx.clone().with_cancel_token(token.clone()));
+    tokio::pin!(fut);
+    tokio::select! {
+        // Biased toward the tool: a call that finishes at the very instant the timer fires has
+        // finished, and its result is the one that counts.
+        biased;
+        out = &mut fut => out,
+        () = tokio::time::sleep(limit) => {
+            token.cancel();
+            match tokio::time::timeout(TOOL_STOP_GRACE, &mut fut).await {
+                // It finished by itself while it was being told to stop, with a result and not an
+                // error: that result is what happened (a pull request that was opened must not be
+                // reported as stopped, or the model may open another).
+                Ok(Ok(output)) if !output.is_error => Ok(output),
+                _ => Ok(ToolOutput::error(timed_out(name, limit))),
+            }
+        }
+    }
+}
+
+/// The call that is the third in a row with the same result is refused after this many that ran.
+const DOOM_LOOP_AFTER: u32 = 2;
+
+/// The refusals after which a run is ended with the closing turn (`limit: "repeated_call"`).
+const DOOM_LOOP_REFUSALS: u32 = 2;
+
+/// What the model is told when it makes the third identical call in a row.
+fn repeated_call(tool: &str) -> String {
+    format!(
+        "Not run: this is the third call in a row of `{tool}` with the same arguments, and the last \
+         two gave the same result. Calling it again will not change it. Change your approach: other \
+         arguments, another tool, or answer with what you know."
+    )
+}
+
+/// FNV-1a over the parts, each followed by a zero byte: stable across processes and versions
+/// (`DefaultHasher` is not), which a hash kept in the durable state must be.
+fn fnv_hex(parts: &[&str]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+/// `value` as text with the keys of every object in order, whatever order the map keeps them in.
+fn canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// The tool name and the canonical arguments of a call, hashed (the raw text for arguments that
+/// were not JSON).
+fn call_key(call: &ToolCall) -> String {
+    match &call.invalid_arguments {
+        Some(raw) => fnv_hex(&[&call.name, "raw", raw]),
+        None => {
+            let mut text = String::new();
+            canonical(&call.arguments, &mut text);
+            fnv_hex(&[&call.name, "json", &text])
+        }
+    }
+}
+
+/// Count the answer of a call that ran: one more in a row when its key and its result are those of
+/// the call before, a new run of one otherwise.
+fn record_answer(
+    state: &mut Conversation,
+    key: String,
+    message: &Message,
+    repeat_key: Option<String>,
+) {
+    let Message::Tool {
+        content, is_error, ..
+    } = message
+    else {
+        state.repeats = None;
+        return;
+    };
+    let answer = fnv_hex(&[if *is_error { "error" } else { "ok" }, content]);
+    let failed = u32::from(*is_error);
+    match &mut state.repeats {
+        Some(repeats) if repeats.key == key => {
+            // Same call again: the same answer counts up; a different one starts the count over. A
+            // call that errs again counts as a failure in a row whatever the error says (a result
+            // that carries a duration or a path never repeats to the byte).
+            if repeats.answer == answer {
+                repeats.count += 1;
+            } else {
+                repeats.count = 1;
+                repeats.answer = answer;
+            }
+            repeats.failing = if *is_error { repeats.failing + 1 } else { 0 };
+            // The same repeat key again counts up whatever the text says.
+            repeats.marked = match (&repeats.marked_with, &repeat_key) {
+                (Some(before), Some(now)) if before == now => repeats.marked + 1,
+                (_, Some(_)) => 1,
+                (_, None) => 0,
+            };
+            repeats.marked_with = repeat_key;
+        }
+        slot => {
+            *slot = Some(Repeats {
+                key,
+                answer,
+                count: 1,
+                refused: 0,
+                failing: failed,
+                marked: u32::from(repeat_key.is_some()),
+                marked_with: repeat_key,
+            });
+        }
+    }
 }
 
 /// The output of a run that ended at a limit, with the answer of its closing turn.

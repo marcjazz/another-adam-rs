@@ -211,6 +211,9 @@ pub enum LimitKind {
     MaxTurns,
     /// `max_tool_calls`.
     MaxToolCalls,
+    /// The model called the same tool, with the same arguments and the same result before, over
+    /// and over (`doom_loop`): the third call in a row was refused twice.
+    RepeatedCall,
 }
 
 impl LimitKind {
@@ -219,8 +222,35 @@ impl LimitKind {
         match self {
             Self::MaxTurns => "max_turns",
             Self::MaxToolCalls => "max_tool_calls",
+            Self::RepeatedCall => "repeated_call",
         }
     }
+}
+
+/// The last tool call of a run and how often in a row it has given the same answer: what the
+/// `doom_loop` rule reads. Both fields are hashes (the call's tool name and canonical arguments,
+/// and the result's content and error flag), so the state holds no copy of either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repeats {
+    /// Hash of the tool name and the canonical arguments.
+    pub key: String,
+    /// Hash of the result's content and `is_error`.
+    pub answer: String,
+    /// How many calls in a row had this key and this answer.
+    pub count: u32,
+    /// How many times the call has been refused since.
+    #[serde(default)]
+    pub refused: u32,
+    /// How many calls in a row with this key ended in an error result, whatever the error said.
+    #[serde(default)]
+    pub failing: u32,
+    /// The repeat key ([`ToolOutput::repeat_key`](crate::ToolOutput::repeat_key)) of the last call, when
+    /// it carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_with: Option<String>,
+    /// How many calls in a row with this key carried that same repeat key.
+    #[serde(default)]
+    pub marked: u32,
 }
 
 /// A [`Limits`](crate::Limits) bound a run reached.
@@ -316,6 +346,11 @@ pub struct Conversation {
     /// another starts without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<LimitHit>,
+    /// The last call that ran and how often in a row it gave the same answer (`doom_loop`).
+    /// Absent from state written before it existed, and not written while `None`; a call that waits
+    /// (a question, a child run) and a run that continues another leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<Repeats>,
     /// What the tool sources said about the tools they offered on the latest model turn
     /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
     /// (the agent reports none) and how long a call may run. It is the notes of **that turn's
@@ -815,6 +850,30 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continued_run_starts_with_no_repeat_count_and_no_limit() {
+        let prior = Conversation {
+            repeats: Some(Repeats {
+                key: "k".into(),
+                answer: "a".into(),
+                count: 2,
+                refused: 1,
+                failing: 2,
+                marked_with: None,
+                marked: 0,
+            }),
+            limit: Some(LimitHit {
+                limit: LimitKind::RepeatedCall,
+                answered: true,
+                answer: None,
+            }),
+            ..Conversation::default()
+        };
+        let next = prior.continued("again", RunId::new());
+        assert_eq!(next.repeats, None);
+        assert_eq!(next.limit, None);
+    }
 
     #[test]
     fn the_ids_a_run_remembers_are_bounded_and_the_oldest_is_given_up() {

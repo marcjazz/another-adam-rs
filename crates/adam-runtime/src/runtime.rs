@@ -201,13 +201,21 @@ pub struct RunView {
 
 impl RunView {
     fn new(rec: RunRecord, env: Envelope, claimed: bool) -> Self {
+        // The wake the runtime set for a watched run (to look at its parent, ADR 0044 slice 10) is
+        // not the agent's: a view says when the agent asked to be woken, so a run waiting for a
+        // person or a message still reads as waiting.
+        let wake_at = if env.hb && rec.status == RunStatus::Parked {
+            env.agent_wake
+        } else {
+            rec.wake_at
+        };
         Self {
             id: rec.id,
             agent: rec.agent,
             conversation_id: rec.conversation_id,
             status: rec.status,
-            wake_at: rec.wake_at,
-            waiting: rec.status == RunStatus::Parked && rec.wake_at.is_none(),
+            wake_at,
+            waiting: rec.status == RunStatus::Parked && wake_at.is_none(),
             claimed,
             output: (rec.status == RunStatus::Done).then_some(env.output),
             error: env.error,
@@ -324,6 +332,44 @@ impl Inner {
         if let Some(notifier) = &self.notifier {
             notifier.publish(Signal::Finished { run }).await;
         }
+    }
+
+    /// Fail `run` with `cancelled: <reason>`; see [`Runtime::cancel`]. A run that is terminal is
+    /// left alone, so asking twice is a no-op (and asking for a run that has finished fires the token
+    /// of a step of ours that is still running it). Also how a child run follows a parent that
+    /// ended (`worker.rs`).
+    pub async fn cancel_run(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
+        for _ in 0..MAX_COMMIT_RETRIES {
+            let rec = self
+                .store
+                .load_run(run)
+                .await?
+                .ok_or(RuntimeError::NotFound(run))?;
+            if rec.status.is_terminal() {
+                // Finished already (maybe cancelled elsewhere): a step of ours
+                // that is still running is pointless.
+                self.fire_cancel(run);
+                return Ok(());
+            }
+            let mut env = Envelope::decode(run, &rec.state)?;
+            let error = format!("cancelled: {reason}");
+            env.error = Some(error.clone());
+            env.inbox.clear();
+            let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
+            match self.store.commit_run(run, rec.version, update).await {
+                Ok(committed) => {
+                    self.fire_cancel(run);
+                    self.announce_finished(run).await;
+                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
+                        .await;
+                    self.notify_parent(&committed).await;
+                    return Ok(());
+                }
+                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(RuntimeError::Contended(format!("run {run}")))
     }
 
     /// Append `inbound` to the inbox of `run`; see [`Runtime::deliver`].
@@ -829,11 +875,12 @@ impl Runtime {
     /// [`child_run_id`](crate::child_run_id), and a step that runs again finds the child it started
     /// instead of starting another.
     ///
-    /// The child is an ordinary run: it has no conversation, and cancelling the parent does not
-    /// cancel it (it finishes within its own limits and its message to the finished parent is
-    /// dropped). `parent` is not checked, so a child started for a parent that does not exist runs
-    /// and its message finds nobody.
-    #[tracing::instrument(skip(self, input))]
+    /// The child is an ordinary run: it has no conversation. **It does not outlive a parent that
+    /// failed**: when `parent` is `Failed` for any reason (a [`cancel`](Self::cancel) included), the
+    /// worker that holds the child fails it with `cancelled: the parent run ended` before it steps and
+    /// on the poll of its cancel watch, and a parked child is looked at once a minute. `parent` is not
+    /// checked when the child is started, and a parent that is not in the store is unknown, not ended:
+    /// it cancels nothing.
     pub async fn start_child(
         &self,
         parent: RunId,
@@ -841,9 +888,28 @@ impl Runtime {
         agent: &str,
         input: Inbound,
     ) -> Result<bool, RuntimeError> {
+        self.start_child_within(parent, id, agent, input, None)
+            .await
+    }
+
+    /// [`start_child`](Self::start_child) with a time limit: the child must finish within `within`
+    /// of now, by the runtime's own clock (`None`: no limit, which is `start_child`). The deadline is
+    /// stored with the run. Past it the worker fails the child with `cancelled: time limit: the run
+    /// did not finish within N min`, before a step and, for a step in flight, within one poll
+    /// (the step's token fires), and a child that is parked is woken at it. The parent gets the
+    /// failure as it gets any: the child's error.
+    #[tracing::instrument(skip(self, input))]
+    pub async fn start_child_within(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        within: Option<Duration>,
+    ) -> Result<bool, RuntimeError> {
         let registered = self.registered(agent)?;
         let new = self
-            .new_run(registered.starter(), input, None, Some(id), None)?
+            .new_run_within(registered.starter(), input, None, Some(id), None, within)?
             .parent(parent);
         match self.inner.store.create_run(new).await {
             Ok(rec) => {
@@ -892,7 +958,6 @@ impl Runtime {
     ///
     /// A round whose own record was purged and is asked for again is not recognised as a repeat
     /// (nothing is left to compare), as for [`start_with_id_continuing`](Self::start_with_id_continuing).
-    #[tracing::instrument(skip(self, input))]
     pub async fn start_child_continuing(
         &self,
         parent: RunId,
@@ -901,6 +966,26 @@ impl Runtime {
         input: Inbound,
         conversation_id: &str,
         prior: Option<RunId>,
+    ) -> Result<bool, RuntimeError> {
+        self.start_child_continuing_within(parent, id, agent, input, conversation_id, prior, None)
+            .await
+    }
+
+    /// [`start_child_continuing`](Self::start_child_continuing) for a round that must finish within
+    /// `within` of now (the same limit as [`start_child_within`](Self::start_child_within), counted
+    /// per round: each round has its own deadline). Past it the round fails and the session stays
+    /// usable, as it does when its parent is cancelled.
+    #[tracing::instrument(skip(self, input))]
+    #[allow(clippy::too_many_arguments)] // `start_child_continuing` and the time limit
+    pub async fn start_child_continuing_within(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        conversation_id: &str,
+        prior: Option<RunId>,
+        within: Option<Duration>,
     ) -> Result<bool, RuntimeError> {
         fn invalid<T>(reason: impl Into<String>) -> Result<T, RuntimeError> {
             Err(RuntimeError::InvalidSession {
@@ -976,12 +1061,13 @@ impl Runtime {
             }
         };
         let new = self
-            .new_run(
+            .new_run_within(
                 registered.starter(),
                 input,
                 prior.zip(state.as_ref()),
                 Some(id),
                 Some(conversation_id),
+                within,
             )?
             .parent(parent);
         self.create_with_id(new).await
@@ -1078,11 +1164,29 @@ impl Runtime {
         id: Option<RunId>,
         conversation_id: Option<&str>,
     ) -> Result<NewRun, RuntimeError> {
+        self.new_run_within(agent, input, prior, id, conversation_id, None)
+    }
+
+    /// [`new_run`](Self::new_run) for a run that must finish within `within` of now, by the
+    /// runtime's own clock.
+    fn new_run_within(
+        &self,
+        agent: &dyn ErasedStarter,
+        input: Inbound,
+        prior: Option<(RunId, &Value)>,
+        id: Option<RunId>,
+        conversation_id: Option<&str>,
+        within: Option<Duration>,
+    ) -> Result<NewRun, RuntimeError> {
         let state = match prior {
             Some((run, state)) => agent.init_continuing(input, state, run)?,
             None => agent.init(input)?,
         };
-        let mut new = NewRun::new(agent.name(), Envelope::new(state).encode()?);
+        let mut envelope = Envelope::new(state);
+        if let Some(within) = within {
+            envelope = envelope.with_limit(self.inner.clock.now(), within);
+        }
+        let mut new = NewRun::new(agent.name(), envelope.encode()?);
         if let Some(id) = id {
             new = new.with_id(id);
         }
@@ -1161,41 +1265,21 @@ impl Runtime {
     /// early (`LlmAgent` drops its model request, the coder kills its
     /// commands), one that does not runs to its end (its result is dropped
     /// either way).
+    ///
+    /// **Cancelling a run cancels the runs that work for it** (ADR 0044 slice 10): a child run, whose
+    /// parent is `Failed` for any reason (this cancel included), is failed with
+    /// `cancelled: the parent run ended` by the worker that holds it, before it steps and on the
+    /// poll of its cancel watch (at most once a second), and its own children after it in turn. A
+    /// running child is told within a second or so, a runnable one when it is claimed, a parked one
+    /// within a minute: a parked child that works for a parent always carries a wake no later than a
+    /// minute away, and at it the runtime reads the parent **before** the agent is stepped, then parks
+    /// the run again without stepping the agent when nothing else is due. A parent that is `Done`
+    /// changes nothing, and one that cannot be loaded (purged by retention, or the store is down) is
+    /// unknown and cancels nothing. Remote A2A tasks a run started are not cancelled by this. Asking twice, or for a
+    /// finished run, is a no-op.
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
-        for _ in 0..MAX_COMMIT_RETRIES {
-            let rec = self
-                .inner
-                .store
-                .load_run(run)
-                .await?
-                .ok_or(RuntimeError::NotFound(run))?;
-            if rec.status.is_terminal() {
-                // Finished already (maybe cancelled elsewhere): a step of ours
-                // that is still running is pointless.
-                self.inner.fire_cancel(run);
-                return Ok(());
-            }
-            let mut env = Envelope::decode(run, &rec.state)?;
-            let error = format!("cancelled: {reason}");
-            env.error = Some(error.clone());
-            env.inbox.clear();
-            let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
-            match self.inner.store.commit_run(run, rec.version, update).await {
-                Ok(committed) => {
-                    self.inner.fire_cancel(run);
-                    self.inner.announce_finished(run).await;
-                    self.inner
-                        .emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
-                        .await;
-                    self.inner.notify_parent(&committed).await;
-                    return Ok(());
-                }
-                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(RuntimeError::Contended(format!("run {run}")))
+        self.inner.cancel_run(run, reason).await
     }
 
     /// Snapshot of a run from its durable record (`None` if it does not exist).
