@@ -246,7 +246,7 @@ pub(crate) async fn stream_response(
             }
             None => {
                 sender.abandon().await;
-                return Err(StreamStop::Failed(ModelError::protocol(
+                return Err(StreamStop::Failed(ModelError::transient(
                     "the model's stream ended without a final message",
                 )));
             }
@@ -649,6 +649,7 @@ mod tests {
             id: "c1".into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         }]);
         let (result, events) = run(model).await;
         let streamed = result.expect("an answer");
@@ -752,9 +753,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stream_that_ends_without_its_final_message_is_a_protocol_error_and_is_abandoned() {
+    async fn a_stream_that_ends_without_its_final_message_is_transient_and_is_abandoned() {
         let (result, events) = run_items(vec![Ok(ModelDelta::Text("Fib".into()))]).await;
-        assert!(matches!(result, Err(ModelError::Protocol { .. })));
+        assert!(matches!(result, Err(ModelError::Transient { .. })));
         assert_eq!(
             pieces(&events),
             [
@@ -770,6 +771,7 @@ mod tests {
             id: "c1".into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         };
         let response = ModelResponse {
             message: Message::Assistant {

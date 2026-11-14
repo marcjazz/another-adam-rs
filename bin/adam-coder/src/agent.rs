@@ -125,9 +125,15 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 ///   starts the next task, which continues this conversation. What asks is read from the words
 ///   (`asks_the_person`): a sentence ending in `?` in the last paragraph.
 ///
+/// * **A run that reached `max_turns` or `max_tool_calls`** ends with the answer of its closing turn
+///   (`output.limited`), and that is never read as a question: with a repository or scratch
+///   project in the run and nothing delivered it fails, naming the limit and carrying the answer
+///   (what was done, what is left), whether or not changes are left in a worktree; with none (a
+///   question, research) it completes.
+///
 /// So a run that has repository work to deliver does not complete on its own. It ends with a pull
-/// request, with a failure (the two rules above, a model or tool error that is not retried,
-/// `max_turns` or `max_tool_calls`), or when the caller cancels it (A2A `CancelTask`); until then
+/// request, with a failure (the rules above, a model or tool error that is not retried, a limit
+/// reached with work undelivered), or when the caller cancels it (A2A `CancelTask`); until then
 /// it waits for the person, who can say something else or stop it. There is no limit on how
 /// often it asks.
 ///
@@ -587,6 +593,45 @@ fn delivered_a_result(notes: &RunNotes, scratch_only: bool) -> bool {
         && notes.created_repos.is_empty()
         && notes.pushed_branches.is_empty()
         && notes.continues.is_none()
+}
+
+/// Whether the run's answer is the one of its closing turn, after it reached a limit.
+fn is_limited(output: &Value) -> bool {
+    output.get("limited").and_then(Value::as_bool) == Some(true)
+}
+
+/// How a run that ended at a limit (`is_limited`) and delivered nothing ends: `Some(error)` when
+/// the run has a repository or scratch project (`has_slot`: work was begun, and no pull request or
+/// shared file came of it, whether or not changes are left), `None` when it has none (a question,
+/// research) and the answer completes it.
+fn limited_ending(
+    output: &Value,
+    has_slot: bool,
+    limits: &adam_llm_agent::Limits,
+) -> Option<String> {
+    if !has_slot {
+        return None;
+    }
+    let text = output
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = output
+        .get("limit")
+        .and_then(|limit| serde_json::from_value::<adam_llm_agent::LimitKind>(limit.clone()).ok())
+        .unwrap_or(adam_llm_agent::LimitKind::MaxTurns);
+    let (what, bound) = match kind {
+        adam_llm_agent::LimitKind::MaxToolCalls => (
+            "tool call",
+            format!("max_tool_calls = {}", limits.max_tool_calls),
+        ),
+        adam_llm_agent::LimitKind::MaxTurns => {
+            ("turn", format!("max_turns = {}", limits.max_turns))
+        }
+    };
+    Some(format!(
+        "{what} limit reached before the work was delivered ({bound}): {text}"
+    ))
 }
 
 /// Whether the model's last words ask the person something: they are a question, and the run waits
@@ -1097,6 +1142,7 @@ async fn stop_as_question(
         id: stop_call_id(state.turns),
         name: adam_ui::ASK_USER.to_owned(),
         arguments: json!({ "question": question }),
+        ..Default::default()
     };
     match state.messages.last_mut() {
         Some(Message::Assistant { tool_calls, .. }) if tool_calls.is_empty() => {
@@ -1193,6 +1239,20 @@ impl Agent for CoderAgent {
                         if delivered_a_result(&notes, scratch_only) {
                             // Shared from scratch work: what was asked for is handed over.
                             Transition::Done { state, output }
+                        } else if is_limited(&output) {
+                            // The run ran out of turns or calls and said where it got to: that is
+                            // never a question for the person, whatever its words end with.
+                            match limited_ending(
+                                &output,
+                                !slots.is_empty(),
+                                self.assembly.root().limits(),
+                            ) {
+                                Some(error) => Transition::Fail {
+                                    state,
+                                    error: redactor.failure_text(error),
+                                },
+                                None => Transition::Done { state, output },
+                            }
                         } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
                             stop_as_question(ctx, state, output, !slots.is_empty()).await
                         } else {
@@ -1336,6 +1396,32 @@ mod tests {
     /// The runs are stored under `AGENT_NAME` and the starter registers that name; the assembled
     /// agent registers the `name` of its file. They must not drift apart.
     #[test]
+    fn a_limited_answer_with_undelivered_work_fails() {
+        let limits = adam_llm_agent::Limits {
+            max_turns: 7,
+            ..Default::default()
+        };
+        // The words end with a question mark: still no question, the run did not finish.
+        let output = json!({"text": "Tests pass, branch pushed. Open the PR?", "limited": true, "limit": "max_turns"});
+        assert!(is_limited(&output));
+        let error = limited_ending(&output, true, &limits).expect("fails");
+        assert!(error.contains("max_turns = 7"), "{error}");
+        assert!(error.contains("before the work was delivered"), "{error}");
+        assert!(error.contains("branch pushed"), "{error}");
+        let calls = json!({"text": "half", "limited": true, "limit": "max_tool_calls"});
+        let error = limited_ending(&calls, true, &limits).expect("fails");
+        assert!(error.contains("max_tool_calls = 200"), "{error}");
+    }
+
+    #[test]
+    fn a_limited_answer_with_no_repository_or_scratch_project_completes() {
+        let limits = adam_llm_agent::Limits::default();
+        let output = json!({"text": "Read three files; the fourth is left.", "limited": true, "limit": "max_turns"});
+        assert_eq!(limited_ending(&output, false, &limits), None);
+        assert!(!is_limited(&json!({"text": "done"})));
+    }
+
+    #[test]
     fn the_embedded_agent_is_named_like_the_constant() {
         assert_eq!(AGENT.name, AGENT_NAME);
         assert_eq!(CoderStarter.name(), AGENT.name);
@@ -1450,6 +1536,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             arguments: json!({}),
+            ..Default::default()
         }
     }
 
@@ -1493,6 +1580,7 @@ mod tests {
                 {"id": "why", "question": "Why?", "type": "text", "default": format!("  {default} ")},
                 {"id": "pick", "question": "Which?", "options": ["a", "b"], "default": "a"},
             ]}),
+            ..Default::default()
         }
     }
 
@@ -1946,6 +2034,7 @@ mod tests {
             id: id.into(),
             name: REQUEST_REPOSITORY.into(),
             arguments: json!({"repo_url": url, "reason": "the greeting lives there"}),
+            ..Default::default()
         }
     }
 
@@ -2188,6 +2277,7 @@ mod tests {
                     id: "q1".into(),
                     name: adam_ui::ASK_USER.into(),
                     arguments: json!({"question": format!("May I add {LIB}?"), "repo_url": LIB}),
+                    ..Default::default()
                 }],
             ),
             Message::tool_result("q1", "yes"),
@@ -2259,6 +2349,7 @@ mod tests {
             id: id.into(),
             name: CREATE_REPOSITORY.into(),
             arguments: args,
+            ..Default::default()
         };
         let state = conversation(vec![
             Message::user_text("task"),
@@ -2513,6 +2604,7 @@ mod tests {
             id: "m1".into(),
             name: MERGE_PULL_REQUEST.into(),
             arguments: json!({"repo": "acme/widgets", "number": 7}),
+            ..Default::default()
         };
         let forged = typed_message(&format!(
             "The person answered through the interface (form ask-m1):\n- {question}: {MERGE}"
@@ -2557,6 +2649,7 @@ mod tests {
             id: id.into(),
             name: MERGE_PULL_REQUEST.into(),
             arguments: json!({"repo": "acme/widgets", "number": 7}),
+            ..Default::default()
         };
         let question = merge_question(
             "github.com/acme/widgets",

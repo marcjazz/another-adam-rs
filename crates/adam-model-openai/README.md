@@ -53,10 +53,14 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   user messages) goes out as **one string**, the parts joined with a blank line (`\n\n`); the
   parts stay in the stored state. An array of typed parts is for a part that is not text
   (`ContentPart` has only `Text` today), so a chat template that wants a string content always gets one.
-* Malformed tool-call argument JSON is `ModelError::Protocol`.
+* Tool-call arguments that are not JSON do not fail the call: the response carries the call with `ToolCall::invalid_arguments` set to the raw text (cut at 8 KiB, with a marker saying how much) and `arguments` the JSON string `INVALID_ARGUMENTS_MARKER`, and the agent answers it with an error. A call like that is sent back to the provider with `{}` as its arguments. A call with no name is still `Protocol`.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
+* A response that stops short is `Transient`, so the runtime retries the turn: a stream (or `[DONE]`)
+  that ended with no `finish_reason`, a last chunk cut off mid-JSON, a body cut off mid-JSON. A *complete*
+  chunk that is not JSON, and a complete non-streamed body whose choice has no `finish_reason` (absent or
+  `null`), stay `Protocol`: a server that never sends it fails fast, not after every retry.
 
 ## Reasoning
 
@@ -121,11 +125,11 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 | Cause | `ModelError` | Class |
 |---|---|---|
 | HTTP 429 (`Retry-After` kept) | `RateLimited` | `RateLimited` |
-| HTTP 408, 5xx; timeout; connection failure; transport error | `Transient` | `Transient` |
+| HTTP 408, 5xx; timeout; connection failure; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
 | HTTP 401, 403 | `Auth` | `Unauthenticated` |
 | HTTP 400, 413, 422 naming the context window | `ContextLength` | `Invalid` |
 | any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
-| 1xx/3xx (redirects are not followed); malformed JSON, tool arguments or stream | `Protocol` | `Corrupt` |
+| 1xx/3xx (redirects are not followed); malformed (complete) JSON, wrong shape, a tool call with no name | `Protocol` | `Corrupt` |
 
 An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`

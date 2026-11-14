@@ -203,6 +203,39 @@ pub struct ArtifactRef {
     pub bytes: Option<u64>,
 }
 
+/// Which [`Limits`](crate::Limits) bound a run reached. Serialised as the bound's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// `max_turns`.
+    MaxTurns,
+    /// `max_tool_calls`.
+    MaxToolCalls,
+}
+
+impl LimitKind {
+    /// The bound's name, as the output's `limit` says it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTurns => "max_turns",
+            Self::MaxToolCalls => "max_tool_calls",
+        }
+    }
+}
+
+/// A [`Limits`](crate::Limits) bound a run reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitHit {
+    /// The bound.
+    pub limit: LimitKind,
+    /// The closing turn has answered.
+    pub answered: bool,
+    /// The output the closing answer ended the run with, kept so that a run reopened with no new
+    /// message ends with exactly it again. Cleared when a message makes another closing turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
+}
+
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history
 /// plus the bookkeeping the loop needs to resume from any commit.
 ///
@@ -272,6 +305,17 @@ pub struct Conversation {
     /// with it. Absent from state written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced_final: bool,
+    /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
+    /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
+    /// written before it existed, and not written while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_cut: bool,
+    /// The limit this run hit, once it has: the next model call is the closing turn (no tool may be
+    /// called), and once that has answered the run finishes with the answer marked limited. Absent
+    /// from state written before it existed, and not written while `None`; a run that continues
+    /// another starts without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitHit>,
     /// What the tool sources said about the tools they offered on the latest model turn
     /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
     /// (the agent reports none) and how long a call may run. It is the notes of **that turn's
@@ -994,6 +1038,7 @@ mod tests {
             id: id.into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         }
     }
 

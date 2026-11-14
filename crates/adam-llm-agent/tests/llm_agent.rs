@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_CARRIED_BYTES,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
+    Artifact, CLOSING_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
+    MAX_CARRIED_BYTES, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
     TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelRequest, ModelResponse, ToolCall, ToolSpec,
+    ModelRequest, ModelResponse, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
@@ -40,6 +40,7 @@ fn call(id: &str, name: &str, args: Value) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: args,
+        ..Default::default()
     }
 }
 
@@ -1745,40 +1746,381 @@ async fn an_unreadable_message_does_not_answer_the_question() {
 // Limits
 // ---------------------------------------------------------------------------
 
+/// Holds the emission of the words of turn `turn` (after that turn's model call is journaled and its
+/// state is not yet committed): it says so, then waits for `release`, or for ever without one.
+struct PauseSink {
+    inner: CollectingSink,
+    turn: u64,
+    reached: Arc<Notify>,
+    release: Option<Arc<Notify>>,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl adam_runtime::EventSink for PauseSink {
+    async fn emit(&self, run: RunId, agent: &str, event: RunEvent) {
+        let at_turn = matches!(
+            &event,
+            RunEvent::Custom { kind, payload }
+                if kind == "agent_text" && payload["turn"] == self.turn
+        );
+        self.inner.emit(run, agent, event).await;
+        if at_turn && self.armed.swap(false, SeqCst) {
+            self.reached.notify_one();
+            match &self.release {
+                Some(release) => release.notified().await,
+                None => std::future::pending::<()>().await,
+            }
+        }
+    }
+}
+
+fn pausing_runtime(
+    agent: &LlmAgent,
+    store: &DynStore,
+    worker: &str,
+    sink: impl adam_runtime::EventSink,
+) -> Runtime {
+    Runtime::builder(store.clone())
+        .agent(agent.clone())
+        .event_sink(sink)
+        .worker_id(worker)
+        .poll_interval(Duration::from_millis(20))
+        .lease_ttl(Duration::from_millis(300))
+        .build()
+}
+
+fn pause_sink(release: Option<Arc<Notify>>) -> (Arc<PauseSink>, Arc<Notify>) {
+    let reached = Arc::new(Notify::new());
+    let sink = Arc::new(PauseSink {
+        inner: CollectingSink::new(),
+        turn: 2,
+        reached: reached.clone(),
+        release,
+        armed: AtomicBool::new(true),
+    });
+    (sink, reached)
+}
+
+fn two_turns(h: &Harness, a: CountingTool) -> LlmAgent {
+    h.agent()
+        .tool(a)
+        .limits(Limits {
+            max_turns: 2,
+            ..Limits::default()
+        })
+        .build()
+}
+
+fn looping(h: &Harness) {
+    for i in 0..2 {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), "a", json!({}))]);
+    }
+}
+
 #[tokio::test]
-async fn max_turns_fails_the_run() {
+async fn a_run_at_max_turns_ends_with_a_limited_answer() {
     let h = Harness::new();
     let (a, a_calls) = CountingTool::new("a");
-    let agent = h
-        .agent()
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_text("I got as far as two lookups");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 3, "two turns with tools, one closing turn");
+    assert_eq!(requests[2].tool_choice, ToolChoice::None);
+    assert_eq!(requests[2].tools, requests[0].tools, "the tools stay");
+    assert_eq!(requests[2].system, requests[0].system);
+    assert_eq!(
+        requests[2].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    assert_eq!(requests[0].tool_choice, ToolChoice::Auto);
+    assert_eq!(a_calls.load(SeqCst), 2);
+    assert_eq!(
+        output_of(&view),
+        Some(json!({
+            "text": "I got as far as two lookups",
+            "artifacts": [],
+            "limited": true,
+            "limit": "max_turns"
+        }))
+    );
+    let state = conversation(&view);
+    assert_eq!(state.turns, 3);
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|m| *m != Message::user_text(CLOSING_TURN)),
+        "the instruction is for that one request, not the history"
+    );
+}
+
+#[tokio::test]
+async fn a_closing_turn_that_calls_tools_anyway_keeps_only_its_text() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_response(ModelResponse {
+        message: Message::Assistant {
+            content: vec![ContentPart::Text {
+                text: "summary".into(),
+            }],
+            tool_calls: vec![call("c9", "a", json!({}))],
+            reasoning: None,
+        },
+        finish: FinishReason::ToolCalls,
+        ..ModelResponse::text("")
+    });
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(a_calls.load(SeqCst), 2, "the stray call never runs");
+    assert_eq!(view.output.as_ref().expect("output")["text"], "summary");
+    let state = conversation(&view);
+    assert!(state.pending_calls.is_empty());
+    let Some(Message::Assistant { tool_calls, .. }) = state.messages.last() else {
+        panic!("{:?}", state.messages)
+    };
+    assert!(
+        tool_calls.is_empty(),
+        "no call without a result in the history"
+    );
+}
+
+#[tokio::test]
+async fn a_closing_turn_with_no_words_fails_naming_the_limit() {
+    let h = Harness::new();
+    let (a, _) = CountingTool::new("a");
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_text("");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(error.contains("turn limit exceeded"), "{error}");
+    assert!(error.contains("max_turns = 2"), "{error}");
+}
+
+/// Runs `loop` up to the closing answer of turn 2 and holds the run there (the answer is journaled,
+/// not committed); `during` runs while it is held.
+async fn held_at_the_closing_answer<F, Fut>(
+    mock: &Arc<MockModel>,
+    during: F,
+) -> (RunView, Arc<MockModel>)
+where
+    F: FnOnce(Runtime, RunId) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let release = Arc::new(Notify::new());
+    let (sink, reached) = pause_sink(Some(release.clone()));
+    let (a, _) = CountingTool::new("a");
+    let model: DynModel = mock.clone();
+    let agent = LlmAgent::builder("llm", model, "m")
         .tool(a)
         .limits(Limits {
             max_turns: 2,
             ..Limits::default()
         })
         .build();
-    for i in 0..5 {
-        h.mock
-            .push_tool_calls(vec![call(&format!("c{i}"), "a", json!({}))]);
-    }
-    let rt = h.runtime(&agent);
+    let store = store();
+    let rt = pausing_runtime(&agent, &store, "w", sink);
     let run = rt
         .start("llm", user_message("loop"), None)
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
-    let view = wait_failed(&rt, run).await;
+    notified(&reached, "the closing answer").await;
+    during(rt.clone(), run).await;
+    release.notify_one();
+    let view = wait_for(&rt, run, "done with the inbox read", |v| {
+        v.status == RunStatus::Done && v.pending_inbox == 0
+    })
+    .await;
     worker.stop().await;
+    (view, mock.clone())
+}
 
-    let error = view.error.clone().expect("error");
-    assert!(error.contains("max_turns = 2"), "{error}");
-    assert_eq!(h.mock.requests().len(), 2, "no third model call");
+fn closing_script() -> Arc<MockModel> {
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("c0", "a", json!({}))])
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("closing words");
+    mock
+}
+
+#[tokio::test]
+async fn a_message_after_the_closing_answer_gets_a_closing_turn_of_its_own() {
+    let mock = closing_script();
+    mock.push_text("second closing words");
+    let (view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
+        rt.deliver(run, user_message("one more thing"))
+            .await
+            .expect("deliver");
+    })
+    .await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4, "the message is read by a closing turn");
+    assert_eq!(requests[3].tool_choice, ToolChoice::None);
+    assert_eq!(
+        requests[3].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    assert!(
+        requests[3]
+            .messages
+            .contains(&Message::user_text("one more thing"))
+    );
+    let output = view.output.as_ref().expect("output");
+    assert_eq!(output["text"], "second closing words");
+    assert_eq!(output["limited"], true);
+    assert_eq!(output["limit"], "max_turns");
+}
+
+#[tokio::test]
+async fn a_reopen_with_nothing_new_re_finishes_identically() {
+    let mock = closing_script();
+    mock.push_text("must never be asked for");
+    let (view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
+        // A message the loop cannot read reopens the run and adds nothing to the history.
+        rt.deliver(
+            run,
+            adam_runtime::Inbound::new("approval", json!({"approved": true})),
+        )
+        .await
+        .expect("deliver");
+    })
+    .await;
+
+    assert_eq!(mock.requests().len(), 3, "no fourth model call");
+    let state = conversation(&view);
+    let kept = state
+        .limit
+        .as_ref()
+        .and_then(|hit| hit.answer.clone())
+        .expect("the answer is kept");
+    assert_eq!(view.output, Some(kept.clone()), "field by field");
+    assert_eq!(kept["text"], "closing words");
+    assert_eq!(kept["limited"], true);
+    assert!(kept["stream"].is_string(), "its stream is kept: {kept}");
+}
+
+#[tokio::test]
+async fn crash_after_the_closing_answer_is_journaled_replays_it_without_a_model_call() {
+    let mock = closing_script();
+    let (sink, reached) = pause_sink(None);
+    let (a, a_calls) = CountingTool::new("a");
+    let model: DynModel = mock.clone();
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .limits(Limits {
+            max_turns: 2,
+            ..Limits::default()
+        })
+        .build();
+    let store = store();
+    let rt_a = pausing_runtime(&agent, &store, "crash-a", sink);
+    let rt_b = pausing_runtime(&agent, &store, "crash-b", CollectingSink::new());
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "the closing answer").await;
+    doomed.handle.abort();
+    assert!(doomed.handle.await.expect_err("aborted").is_cancelled());
+    assert_eq!(mock.requests().len(), 3);
+
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+
+    assert_eq!(mock.requests().len(), 3, "the journaled answer is replayed");
     assert_eq!(a_calls.load(SeqCst), 2);
-    assert_eq!(conversation(&view).turns, 2);
+    let output = output_of(&view).expect("output");
+    assert_eq!(output["text"], "closing words");
+    assert_eq!(output["limited"], true);
 }
 
 #[tokio::test]
-async fn max_tool_calls_fails_the_run_across_turns() {
+async fn crash_during_the_closing_turn_replays_its_answer() {
+    let mock = Arc::new(MockModel::new());
+    let reached = Arc::new(Notify::new());
+    let model: DynModel = Arc::new(HangingModel {
+        inner: mock.clone(),
+        hang_on: 2,
+        calls: AtomicUsize::new(0),
+        armed: AtomicBool::new(true),
+        reached: reached.clone(),
+    });
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .limits(Limits {
+            max_turns: 2,
+            ..Limits::default()
+        })
+        .build();
+    mock.push_tool_calls(vec![call("c0", "a", json!({}))])
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("closing words");
+    let h = Harness::new();
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "crash-a", short_lease),
+        h.runtime_with(&agent, "crash-b", short_lease),
+    );
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "the closing turn").await;
+    doomed.handle.abort();
+    assert!(doomed.handle.await.expect_err("aborted").is_cancelled());
+
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+
+    assert_eq!(a_calls.load(SeqCst), 2);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].tool_choice, ToolChoice::None);
+    assert_eq!(
+        requests[2].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    let output = view.output.expect("output");
+    assert_eq!(output["text"], "closing words");
+    assert_eq!(output["limited"], true);
+}
+
+#[tokio::test]
+async fn max_tool_calls_ends_the_run_limited_across_turns() {
     let h = Harness::new();
     let (a, a_calls) = CountingTool::new("a");
     let agent = h
@@ -1789,27 +2131,37 @@ async fn max_tool_calls_fails_the_run_across_turns() {
             ..Limits::default()
         })
         .build();
-    for i in 0..5 {
+    for i in 0..3 {
         h.mock
             .push_tool_calls(vec![call(&format!("c{i}"), "a", json!({}))]);
     }
+    h.mock.push_text("two calls made");
     let rt = h.runtime(&agent);
     let run = rt
         .start("llm", user_message("loop"), None)
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
-    let view = wait_failed(&rt, run).await;
+    let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let error = view.error.expect("error");
-    assert!(error.contains("max_tool_calls = 2"), "{error}");
     assert_eq!(a_calls.load(SeqCst), 2, "the third call never runs");
-    assert_eq!(h.mock.requests().len(), 3);
+    assert_eq!(h.mock.requests().len(), 4);
+    let output = view.output.clone().expect("output");
+    assert_eq!(output["limit"], "max_tool_calls");
+    assert_eq!(output["text"], "two calls made");
+    let state = conversation(&view);
+    let Message::Tool {
+        content, is_error, ..
+    } = &state.messages[6]
+    else {
+        panic!("{:?}", state.messages)
+    };
+    assert!(*is_error && content.contains("not run"), "{content}");
 }
 
 #[tokio::test]
-async fn max_tool_calls_rejects_an_oversized_turn_before_running_any_tool() {
+async fn max_tool_calls_answers_an_oversized_turn_not_run_and_then_closes() {
     let h = Harness::new();
     let (a, a_calls) = CountingTool::new("a");
     let agent = h
@@ -1820,21 +2172,214 @@ async fn max_tool_calls_rejects_an_oversized_turn_before_running_any_tool() {
             ..Limits::default()
         })
         .build();
-    h.mock.push_tool_calls(vec![
-        call("c1", "a", json!({})),
-        call("c2", "a", json!({})),
-        call("c3", "a", json!({})),
-    ]);
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "a", json!({})),
+            call("c2", "a", json!({})),
+            call("c3", "a", json!({})),
+        ])
+        .push_text("I could not run them");
     let rt = h.runtime(&agent);
     let run = rt
         .start("llm", user_message("many"), None)
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(a_calls.load(SeqCst), 0);
+    let state = conversation(&view);
+    for (i, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
+        let Message::Tool {
+            call_id,
+            content,
+            is_error,
+        } = &state.messages[2 + i]
+        else {
+            panic!("{:?}", state.messages)
+        };
+        assert_eq!(call_id, id);
+        assert!(*is_error);
+        assert!(content.contains("not run"), "{content}");
+        assert!(content.contains("max_tool_calls = 2"), "{content}");
+    }
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].tool_choice, ToolChoice::None);
+    assert_eq!(
+        requests[1].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    let output = view.output.expect("output");
+    assert_eq!(output["text"], "I could not run them");
+    assert_eq!(output["limited"], true);
+    assert_eq!(output["limit"], "max_tool_calls");
+}
+
+fn invalid_call_response(id: &str, name: &str, raw: &str, finish: FinishReason) -> ModelResponse {
+    ModelResponse {
+        message: Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall::with_invalid_arguments(id, name, raw)],
+            reasoning: None,
+        },
+        finish,
+        ..ModelResponse::text("")
+    }
+}
+
+#[tokio::test]
+async fn a_stream_without_finish_reason_is_retried() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_error(ModelError::transient(
+            "stream ended without a finish_reason",
+        ))
+        .push_text("whole answer");
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.output.expect("output")["text"], "whole answer");
+    assert_eq!(h.mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_an_error_result_and_the_run_completes() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = h.agent().tool(a).build();
+    h.mock
+        .push_response(invalid_call_response(
+            "c1",
+            "a",
+            "{\"city\": ",
+            FinishReason::Length,
+        ))
+        .push_text("fixed it");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        a_calls.load(SeqCst),
+        0,
+        "a call that is not JSON never runs"
+    );
+    let state = conversation(&view);
+    let Message::Tool {
+        call_id,
+        content,
+        is_error,
+    } = &state.messages[2]
+    else {
+        panic!("{:?}", state.messages)
+    };
+    assert_eq!(call_id, "c1");
+    assert!(*is_error);
+    for needle in [
+        "not valid JSON",
+        "{\"city\": ",
+        "did not run",
+        "output limit",
+    ] {
+        assert!(content.contains(needle), "{needle}: {content}");
+    }
+    // What goes back to the model as the call's arguments is `{}`, never the raw text.
+    let Message::Assistant { tool_calls, .. } = &h.mock.requests()[1].messages[1] else {
+        panic!("{:?}", h.mock.requests()[1].messages)
+    };
+    assert_eq!(
+        tool_calls[0].arguments,
+        json!(adam_model::INVALID_ARGUMENTS_MARKER)
+    );
+    assert_eq!(view.output.expect("output")["text"], "fixed it");
+    let journal = h.store.journal_list(run).await.expect("journal");
+    assert!(
+        journal.iter().all(|e| e.name != "tool:c1"),
+        "the answer comes from the journaled model turn alone"
+    );
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_count_against_max_tool_calls() {
+    let h = Harness::new();
+    let (a, _) = CountingTool::new("a");
+    let agent = h
+        .agent()
+        .tool(a)
+        .limits(Limits {
+            max_tool_calls: 2,
+            ..Limits::default()
+        })
+        .build();
+    for i in 0..5 {
+        h.mock.push_response(invalid_call_response(
+            &format!("c{i}"),
+            "a",
+            "{oops",
+            FinishReason::ToolCalls,
+        ));
+    }
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
     let view = wait_failed(&rt, run).await;
     worker.stop().await;
-    assert!(view.error.expect("error").contains("asked for 3 more"));
-    assert_eq!(a_calls.load(SeqCst), 0);
+    assert!(
+        view.error
+            .clone()
+            .expect("error")
+            .contains("max_tool_calls = 2")
+    );
+    assert_eq!(conversation(&view).tool_calls, 2);
+}
+
+#[tokio::test]
+async fn a_replayed_invalid_call_calls_no_model_and_answers_the_same() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let recorded = json!({
+        "message": serde_json::to_value(Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall::with_invalid_arguments("c1", "a", "{oops")],
+            reasoning: None,
+        })
+        .unwrap(),
+        "finish": "tool_calls",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    h.store
+        .journal_put(run, JournalEntry::ok(0, "model:0", recorded))
+        .await
+        .expect("seed the journal");
+    h.mock.push_text("after");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(h.mock.requests().len(), 1, "turn 0 was recorded");
+    let state = conversation(&view);
+    assert!(
+        matches!(&state.messages[2], Message::Tool { content, is_error: true, .. } if content.contains("{oops"))
+    );
 }
 
 #[tokio::test]

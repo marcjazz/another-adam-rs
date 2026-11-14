@@ -212,13 +212,18 @@ fn wire_message(
         } => {
             let mut wire_calls = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
-                let arguments = serde_json::to_string(&call.arguments).map_err(|e| {
-                    ModelError::invalid_request(format!(
-                        "arguments of tool call {} are not serializable",
-                        call.id
-                    ))
-                    .with_source(e)
-                })?;
+                // A call whose text was not JSON goes back as `{}`: the text is not echoed.
+                let arguments = if call.invalid_arguments.is_some() {
+                    "{}".to_owned()
+                } else {
+                    serde_json::to_string(&call.arguments).map_err(|e| {
+                        ModelError::invalid_request(format!(
+                            "arguments of tool call {} are not serializable",
+                            call.id
+                        ))
+                        .with_source(e)
+                    })?
+                };
                 wire_calls.push(json!({
                     "id": call.id,
                     "type": "function",
@@ -261,8 +266,13 @@ fn wire_message(
 
 /// Parse a non-streaming response body.
 pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|e| ModelError::protocol("response is not JSON").with_source(e))?;
+    let value: Value = serde_json::from_slice(body).map_err(|e| {
+        if e.is_eof() {
+            ModelError::transient("response body ended early").with_source(e)
+        } else {
+            ModelError::protocol("response is not JSON").with_source(e)
+        }
+    })?;
     if value.get("choices").is_none() && value.get("error").is_some() {
         return Err(from_error_object(&value));
     }
@@ -291,15 +301,18 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         let arguments = match call.function.arguments {
             None | Some(Value::Null) => json!({}),
             // Some servers send the arguments as an object instead of a string.
-            Some(Value::String(raw)) => parse_arguments(&name, &raw)?,
+            Some(Value::String(raw)) => match parse_arguments(&raw) {
+                Ok(parsed) => parsed,
+                Err(raw) => {
+                    check_name(&name)?;
+                    tool_calls.push(ToolCall::with_invalid_arguments(id, name, raw));
+                    continue;
+                }
+            },
             Some(other) => other,
         };
         check_name(&name)?;
-        tool_calls.push(ToolCall {
-            id,
-            name,
-            arguments,
-        });
+        tool_calls.push(ToolCall::new(id, name, arguments));
     }
 
     let mut response = build_response(
@@ -430,17 +443,25 @@ fn check_name(name: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// Parse tool-call arguments. Empty means "no arguments"; anything else must
-/// be valid JSON.
-fn parse_arguments(name: &str, raw: &str) -> Result<Value, ModelError> {
+/// The most of an invalid argument text that is kept (the journal and the state hold it).
+const MAX_INVALID_ARGUMENTS: usize = 8 * 1024;
+
+/// Parse tool-call arguments. Empty means "no arguments"; text that is not JSON comes back as
+/// `Err(raw)`, cut to [`MAX_INVALID_ARGUMENTS`] bytes on a char boundary, for the agent to answer
+/// the call with an error instead of failing the run.
+fn parse_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(raw).map_err(|e| {
-        ModelError::protocol(format!(
-            "arguments of tool call `{name}` are not valid JSON"
-        ))
-        .with_source(e)
+    serde_json::from_str(raw).map_err(|_| {
+        if raw.len() <= MAX_INVALID_ARGUMENTS {
+            return raw.to_owned();
+        }
+        let mut end = MAX_INVALID_ARGUMENTS;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{} [{} bytes cut]", &raw[..end], raw.len() - end)
     })
 }
 
@@ -551,8 +572,23 @@ impl Assembler {
     /// Consume one SSE `data:` payload (not `[DONE]`), returning the deltas to
     /// forward to the caller.
     pub(crate) fn push(&mut self, data: &str) -> Result<Vec<ModelDelta>, ModelError> {
-        let value: Value = serde_json::from_str(data)
-            .map_err(|e| ModelError::protocol("stream chunk is not JSON").with_source(e))?;
+        self.push_event(data, false)
+    }
+
+    /// Like [`Assembler::push`] for the event handed over when the connection closed without its
+    /// terminator: a payload cut off mid-JSON is a truncated response, so it is transient.
+    pub(crate) fn push_last(&mut self, data: &str) -> Result<Vec<ModelDelta>, ModelError> {
+        self.push_event(data, true)
+    }
+
+    fn push_event(&mut self, data: &str, last: bool) -> Result<Vec<ModelDelta>, ModelError> {
+        let value: Value = serde_json::from_str(data).map_err(|e| {
+            if last && e.is_eof() {
+                ModelError::transient("stream ended inside a chunk").with_source(e)
+            } else {
+                ModelError::protocol("stream chunk is not JSON").with_source(e)
+            }
+        })?;
         if value.get("choices").is_none() && value.get("error").is_some() {
             return Err(from_error_object(&value));
         }
@@ -620,15 +656,14 @@ impl Assembler {
     pub(crate) fn finish(self) -> Result<ModelResponse, ModelError> {
         let reason = self
             .finish_reason
-            .ok_or_else(|| ModelError::protocol("stream ended without a finish_reason"))?;
+            .ok_or_else(|| ModelError::transient("stream ended without a finish_reason"))?;
         let mut tool_calls = Vec::with_capacity(self.calls.len());
         for call in self.calls.into_values() {
             check_name(&call.name)?;
-            let arguments = parse_arguments(&call.name, &call.arguments)?;
-            tool_calls.push(ToolCall {
-                id: call.id.unwrap_or_else(fallback_id),
-                name: call.name,
-                arguments,
+            let id = call.id.unwrap_or_else(fallback_id);
+            tool_calls.push(match parse_arguments(&call.arguments) {
+                Ok(arguments) => ToolCall::new(id, call.name, arguments),
+                Err(raw) => ToolCall::with_invalid_arguments(id, call.name, raw),
             });
         }
         let mut response = build_response(
@@ -659,6 +694,7 @@ mod tests {
                     id: "c1".into(),
                     name: "weather".into(),
                     arguments: json!({"city": "Paris"}),
+                    ..Default::default()
                 }],
                 reasoning: None,
             },
@@ -778,6 +814,7 @@ mod tests {
                 id: "c1".into(),
                 name: "weather".into(),
                 arguments: json!({"city": "Paris"}),
+                ..Default::default()
             }],
             reasoning: Some("I should look it up".into()),
         };
@@ -974,8 +1011,6 @@ mod tests {
         for body in [
             &b"not json"[..],
             br#"{"choices":[]}"#,
-            br#"{"choices":[{"message":{"content":"x"}}]}"#,
-            br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"name":"w","arguments":"{oops"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":"nope"}"#,
         ] {
@@ -985,6 +1020,61 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    #[test]
+    fn a_complete_completion_without_a_finish_reason_is_a_protocol_error() {
+        for body in [
+            &br#"{"choices":[{"message":{"content":"x"}}]}"#[..],
+            br#"{"choices":[{"message":{"content":"x"},"finish_reason":null}]}"#,
+        ] {
+            assert!(
+                matches!(parse_completion(body), Err(ModelError::Protocol { .. })),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_invalid_argument_text_is_cut_on_a_char_boundary() {
+        // Multi-byte characters around the cut: 8192 is inside one of them.
+        let raw = format!("{{\"a\": {}", "\u{e9}\u{4e2d}".repeat(10_000));
+        assert!(raw.len() > 30_000);
+        let kept = parse_arguments(&raw).unwrap_err();
+        let (text, note) = kept.split_once(" [").expect("a marker");
+        assert!(text.len() <= MAX_INVALID_ARGUMENTS && raw.starts_with(text));
+        assert_eq!(note, format!("{} bytes cut]", raw.len() - text.len()));
+        // And a short one is untouched.
+        assert_eq!(parse_arguments("{oops").unwrap_err(), "{oops");
+    }
+
+    #[test]
+    fn an_invalid_call_is_echoed_as_empty_arguments() {
+        let call = adam_model::ToolCall::with_invalid_arguments("c", "w", "{oops");
+        let message = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![call],
+            reasoning: None,
+        };
+        let wire = wire_message(&message, None).unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["tool_calls"][0]["function"]["arguments"], "{}");
+        let text = json.to_string();
+        assert!(
+            !text.contains("oops") && !text.contains("valid JSON"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_completion_cut_inside_its_json_is_transient() {
+        let body = &br#"{"choices":[{"message":{"content":"x"#[..];
+        assert!(
+            matches!(parse_completion(body), Err(ModelError::Transient { .. })),
+            "{}",
+            String::from_utf8_lossy(body)
+        );
     }
 
     #[test]
@@ -1213,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_streamed_arguments_are_a_protocol_error() {
+    fn malformed_streamed_arguments_are_kept_raw() {
         let mut asm = Assembler::default();
         feed(
             &mut asm,
@@ -1222,17 +1312,20 @@ mod tests {
                 r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             ],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
+        let response = asm.finish().unwrap();
+        let call = &response.message.tool_calls()[0];
+        assert_eq!(call.invalid_arguments.as_deref(), Some("{\"x\": "));
+        assert_eq!(call.arguments, json!(adam_model::INVALID_ARGUMENTS_MARKER));
     }
 
     #[test]
-    fn finishing_without_a_reason_is_a_protocol_error() {
+    fn finishing_without_a_reason_is_transient() {
         let mut asm = Assembler::default();
         feed(
             &mut asm,
             &[r#"{"choices":[{"delta":{"content":"partial"}}]}"#],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
+        assert!(matches!(asm.finish(), Err(ModelError::Transient { .. })));
     }
 
     #[test]
