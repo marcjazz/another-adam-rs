@@ -23,13 +23,14 @@ over A2A).
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, and `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the record, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `UsageEvent`, `UsageTotals`, `UsageTotal`, `Usage`, `MAX_USAGE_CALL_BYTES`, `MAX_USAGE_LABEL_BYTES`, `MAX_USAGE_TOTALS` | `RunEvent::Usage`: one model call completed, its tokens (`Usage`, re-exported from `adam-model`), its model, provider and context window, and the step of the task it ran under; and a task's totals, one entry per provider and model; see *Usage*. `Emitter::emit_for(run, event)` sends an event as another run's (a child's call is its root's) |
 | `SandboxUsage`, `SandboxEntry`, `SandboxEnvironment`, `MAX_SANDBOX_ENTRIES` | the time a run's commands ran in a sandbox (a run pod), one `SandboxEntry` per shape (`cpu_millis`, `memory_bytes`, `commands`, `milliseconds`), at most 8, and the environment they ran in; what a tool reports (`ToolCtx::report_sandbox` in `adam-llm-agent`), what the agent keeps in its state next to the totals, and what the A2A server writes as `sandbox`; see *Usage* |
-| `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
+| `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND`, `CHILD_REPORTED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`, or `adam.child.reported` for a session round) |
+| `session_conversation_id`, `session_conversation_prefix`, `parse_session_conversation_id`, `SessionState`, `RoundOutcome`, `SessionSummary`, `SessionList` | child sessions (ADR 0045, slice 1): the conversation id the rounds of a session share, and what `list_sessions` returns |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Usage`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber* |
 | `REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS` | the bounds of `BroadcastSink`'s replay: 64 events per run, none older than 30 s, 64 runs |
 | `Artifact`, `ArtifactFile`, `ArtifactFileError`, `MAX_ARTIFACT_FILE_BYTES`, `MAX_ARTIFACT_FILENAME_BYTES`, `MAX_RUN_FILE_BYTES` | an output of the run, in two forms: a JSON artifact (`Artifact::new(name, mime_type, data)`) and a **file artifact** (`Artifact::file(name, media_type, filename, bytes)`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)), whose `file` holds the filename and the bytes and whose `data` is `null`. `Artifact` and `ArtifactFile` are `#[non_exhaustive]`; `Artifact::file_sha256()` is the SHA-256 of a file's bytes as 64 lower-case hex digits (`None` for a JSON artifact): the name the person's screen keeps the file under, which an `ask_user` option names as its picture. `RunEvent::Artifact` has a `file` member too. Journaled as `{"filename", "bytes": "<base64>"}`, and an artifact journaled before the file form existed has no `file` and reads as it did. `Artifact::file` refuses a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), a filename that is not a name (empty, a path, a `:`, control characters, over 255 bytes) and a media type that is not `type/subtype`; `Debug` prints a file's size, never its bytes. A run keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files: the runtime keeps what it is given, and the agent loop (`adam-llm-agent`) enforces it. Journal cost: the bytes, as base64 (a third more), are in the journal entry of the step that made the file and in every commit of the run's state after it, which is why the caps are what they are. The journal entry is written with the tool's whole result, **before** the loop applies the run's cap, so a tool that returns several files it did not choose bounds its result by what the run may still share (`ReceivedFiles`, `ToolCtx::files_left`): one entry then stays within the run's 6 MiB (about 8 MiB of base64), under MongoDB's 16 MiB document |
@@ -168,7 +169,62 @@ Cancelling a parent does not cancel its children. Take the inbox in every step t
 step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
 and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
 the tests that make each happen are in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
-`adam-llm-agent` does all of this for a tool that returns `ToolError::AwaitRun`.
+
+### Child sessions (ADR 0045, slice 1)
+
+A *session* is a chain of child runs ("rounds") of **one agent** that share a conversation id. Nothing is
+stored for it: the session id is round 1's run id, and the conversation id is
+`session_conversation_id(parent_conversation, session)`.
+
+* **The conversation id.** The parent's conversation id with `%` written `%25` and `/` written `%2F`, then
+  `/s/` and the session id. A client chooses its A2A context id freely, so without the escape a parent
+  whose id holds `/s/` would be indistinguishable from the session of another; with it the first `/` is
+  the separator, and `parse_session_conversation_id` is the exact inverse (a property test holds it). The
+  cost: a parent id that holds `%` or `/` is not a literal prefix of its sessions' ids (an owner prefix such
+  as `subject:` still is, unless the subject holds those characters). The id is at most
+  `MAX_SESSION_CONVERSATION_BYTES` (1024) long: it is an indexed column (PostgreSQL's b-tree entries are
+  limited to about a third of a page, MongoDB indexes the string and a unique `open_key` that embeds it), so
+  the bound is a margin below both (*unverified* against their current documentation).
+* **`Runtime::start_child_continuing(parent, id, agent, input, conversation_id, prior)`** is `start_child`
+  for a round. Round 1 passes `prior: None` and the session id as `id`; round n passes round n-1's run and
+  starts from its state, as a task continues a finished one. It checks what it can see, and answers
+  `RuntimeError::InvalidSession` (class `Invalid`, naming what did not match) for: a conversation id that is
+  not a session's or is too long; round 1 without the session id, or a later round with it; an existing run
+  with `id` that is not this round (another agent, conversation or, for round 1, parent); a `prior` of
+  another conversation, or of a session whose round 1 is missing or has no parent (a root conversation that
+  merely spells a session's id is no session). A `prior` of another agent is `WrongAgent`.
+  A repeat of the same round answers `false`, before `prior` is read.
+* **One open round, one agent.** The store allows one open run per agent and conversation, and a session
+  has one agent (round 1's id is fixed and every `prior` must be the agent's own), so one round is open at a
+  time. A start while one is open, with that round as `prior`, is `ConversationBusy`. Its class,
+  `Rejected`, is shared with `Finished`, so a caller that must tell "steer the open round" from "that run is
+  over" asks `RuntimeError::is_busy()`, the one place a caller decides from the variant. It steers with
+  `deliver`, and the round reads that as it reads any steered message.
+* **The notice.** A child with a conversation reports its end as **`adam.child.reported`**
+  (`CHILD_REPORTED_KIND`, read with `ChildStatus::from_report`), not `adam.run.finished`. Id and payload are
+  the same (the round's run id; a `ChildStatus`) and so is its standing: a hint that wakes the parent, which
+  reads the round with `Ctx::child_status`. A child with no conversation keeps `adam.run.finished`
+  unchanged. **No agent reads a report until slice 2**: `LlmAgent` drops it (it is not the person's
+  message), and `Ctx::arrived` and the reopen-on-arrival rule do not count it, as they do not count a
+  finished notice. Slices 2 and 3 make a report reopen a turn on purpose (ADR 0045 decision 4).
+* **`Runtime::list_sessions(parent_conversation, agents, offset, limit)`** lists the parent's sessions from
+  the runs alone (`list_runs` with the prefix `escaped parent + "/s/"`; no new `Store` method): the latest
+  round of each, working first, then most recently updated, then by id. `limit` is capped at
+  `MAX_SESSION_PAGE` (100), `agents` names the agents to look at (a run listing is per agent; a name given
+  twice counts once). A row needs round 1 (the run whose id is the session id) with a parent, so a session
+  whose round 1 was purged is not listed. Each row has `state` (`Working` while its latest round is open,
+  else `Idle`) and `outcome` (`Done`, `Failed` or `Cancelled`, `None` while working). `SessionState` is a
+  closed enum on purpose (Rule 3): whether a session is closed is written in its header (slice 2), so
+  `Closed` arrives then as a deliberate breaking addition. The round number counts the rounds still in the
+  store.
+* **Races and limits.** `list_runs` pages by `updated_at`, so a round that commits between two page reads
+  can move past the cursor and be missed. The listing counts again after the scan and repeats it when the
+  counts differ, up to three times, then fails with `RuntimeError::Contended`; it never returns a page it
+  knows is short. More than `MAX_SESSION_ROUNDS_SCANNED` (5000) rounds of one agent under one parent is
+  `RuntimeError::TooManyRounds` (class `Rejected`).
+* **Purged rounds.** A round whose own record was purged and is asked for again is not recognised as a
+  repeat (nothing is left to compare), as for `start_with_id_continuing`; keep `purge_finished` retention
+  above any retry window and above `idle_ttl` (ADR 0045).
 
 ## A late subscriber
 
@@ -359,9 +415,9 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 | `RuntimeError` | Class |
 |---|---|
-| `UnknownAgent`, `WrongAgent { run, agent }` | `Invalid` |
+| `UnknownAgent`, `WrongAgent { run, agent }`, `InvalidSession { reason }` | `Invalid` |
 | `NotFound` | `NotFound` |
-| `Finished`, `ConversationBusy` | `Rejected` |
+| `Finished`, `ConversationBusy` (`is_busy()`), `TooManyRounds { runs, max }` | `Rejected` |
 | `Corrupt { run, reason, source }` | `Corrupt` |
 | `Contended` | `Conflict` |
 | `Agent(e)`, `Store(e)` | the class of `e` |
@@ -389,7 +445,7 @@ No Cargo features, no environment variables at runtime.
 `continuing_checks_the_prior_run_and_creates_nothing_when_it_refuses`,
 `a_prior_state_that_does_not_decode_starts_the_run_fresh`,
 `an_agent_without_an_override_starts_fresh_when_asked_to_continue`,
-`start_continuing_delivers_to_an_open_run_and_otherwise_continues`; a repeat of a started run answers `false`
+`start_continuing_delivers_to_an_open_run_and_otherwise_continues`; the session cases (`a_session_round_carries_the_previous_rounds_conversation`, `a_round_is_refused_while_one_is_open_and_deliver_steers`, `a_repeated_session_start_returns_the_same_round`, `the_notice_kind_depends_on_the_childs_conversation`, `the_sessions_of_a_parent_are_listed_sorted_paged_and_scoped`, `a_lost_round_report_is_recovered_by_reading_the_round`); a repeat of a started run answers `false`
 even when its prior is wrong or gone), the pair
 `pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
 unfinished run so all three own something, then twelve six-step runs stepped together: each run

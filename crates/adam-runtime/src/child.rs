@@ -24,8 +24,20 @@ use crate::runtime::{Runtime, RuntimeError};
 /// at-least-once) recognises the second by the id, and its payload is a [`ChildStatus`].
 pub const RUN_FINISHED_KIND: &str = "adam.run.finished";
 
+/// [`Inbound::kind`] of the message the round of a child *session* sends its parent when it ends,
+/// instead of [`RUN_FINISHED_KIND`] (ADR 0045). A child run has a conversation exactly when it is
+/// a session round, so the runtime picks the kind by that.
+///
+/// It has the same id (the round's run id) and payload ([`ChildStatus`]) and the same standing:
+/// a hint that wakes the parent, which reads the round from the store (Rule 5). It is a kind of
+/// its own because a session reports once per round, not once, and the parent must not read it as
+/// the end of a call it is waiting on.
+pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
+
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
-/// all of them but the [`RUN_FINISHED_KIND`] notices. A notice only saves a waiting parent its
+/// all of them but the [`RUN_FINISHED_KIND`] notices and, for now, the [`CHILD_REPORTED_KIND`]
+/// ones. No agent reads a report before ADR 0045 slice 2, so counting it would reopen a run that
+/// has nothing to do with it; slices 2 and 3 make a report reopen a turn on purpose (decision 4). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
@@ -33,7 +45,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
     inbox
         .iter()
         .skip(base)
-        .filter(|i| i.kind != RUN_FINISHED_KIND)
+        .filter(|i| i.kind != RUN_FINISHED_KIND && i.kind != CHILD_REPORTED_KIND)
         .count()
 }
 
@@ -184,9 +196,9 @@ impl ChildStatus {
     }
 
     /// The message that tells the parent of `child` about this status.
-    pub(crate) fn notice(&self, child: RunId) -> Inbound {
+    pub(crate) fn notice(&self, child: RunId, kind: &str) -> Inbound {
         let payload = serde_json::to_value(self).unwrap_or(Value::Null);
-        Inbound::new(RUN_FINISHED_KIND, payload).with_id(child.to_string())
+        Inbound::new(kind, payload).with_id(child.to_string())
     }
 
     /// Read a [`RUN_FINISHED_KIND`] message: the child it is about and its final status. `None`
@@ -208,7 +220,17 @@ impl ChildStatus {
     /// assert!(ChildStatus::from_notice(&Inbound::new("message", json!({}))).is_none());
     /// ```
     pub fn from_notice(inbound: &Inbound) -> Option<(RunId, Self)> {
-        if inbound.kind != RUN_FINISHED_KIND {
+        Self::from_message(inbound, RUN_FINISHED_KIND)
+    }
+
+    /// [`from_notice`](Self::from_notice) for a [`CHILD_REPORTED_KIND`] message: the round it is
+    /// about and its final status.
+    pub fn from_report(inbound: &Inbound) -> Option<(RunId, Self)> {
+        Self::from_message(inbound, CHILD_REPORTED_KIND)
+    }
+
+    fn from_message(inbound: &Inbound, kind: &str) -> Option<(RunId, Self)> {
+        if inbound.kind != kind {
             return None;
         }
         let run = Uuid::parse_str(&inbound.id).ok().map(RunId)?;
@@ -268,10 +290,20 @@ mod tests {
             output: None,
             error: Some("boom".into()),
         };
-        let notice = status.notice(child);
+        let notice = status.notice(child, RUN_FINISHED_KIND);
         assert_eq!(notice.kind, RUN_FINISHED_KIND);
         assert_eq!(notice.id, child.to_string());
-        assert_eq!(ChildStatus::from_notice(&notice), Some((child, status)));
+        assert_eq!(
+            ChildStatus::from_notice(&notice),
+            Some((child, status.clone()))
+        );
+        assert!(ChildStatus::from_report(&notice).is_none());
+
+        let report = status.notice(child, CHILD_REPORTED_KIND);
+        assert_eq!(report.kind, CHILD_REPORTED_KIND);
+        assert_eq!(report.payload, notice.payload, "same payload, other kind");
+        assert_eq!(ChildStatus::from_report(&report), Some((child, status)));
+        assert!(ChildStatus::from_notice(&report).is_none());
     }
 
     #[test]

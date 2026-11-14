@@ -106,6 +106,38 @@ the next step read `take_inbox()` for messages of kind `adam.run.finished` (`Chi
 already in the inbox when a step starts is not "arrived during the step", so an agent that parks without
 reading it sleeps until its timer.
 
+## Sessions (ADR 0045, slice 1)
+
+[ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
+background as a session that is sent more messages. Only the runtime half exists so far (`crates/adam-runtime`).
+
+**What exists.**
+
+* `Runtime::start_child_continuing` starts a child run **with a conversation id**: the parent's id (with `%` and
+  `/` escaped, so a client's context id cannot spell another session's), then `/s/` and the session id
+  (`session_conversation_id`). Round 1's run id, `child_run_id(parent, call_id)`, is the session id. From round 2
+  on the child starts from the previous round's state (`init_continuing`, ADR 0003). A session has one agent,
+  and the store allows one open run per agent and conversation, so a start while a round is open is
+  `ConversationBusy` (`is_busy()`): the caller sends a message with `Runtime::deliver`, which the open round reads
+  as a steered message. Everything the runtime can check is refused as `InvalidSession`: a `prior` of another
+  conversation or of a session with no first round, a run id that exists and is not this round, a conversation id
+  that is not a session's or is over 1024 bytes. A repeat with the same ids answers `false`; a round purged
+  before its repeat is not recognised (retention must outlast retries).
+* A child with a conversation reports its end with **`adam.child.reported`** instead of `adam.run.finished`.
+  Same id, same payload, same standing: a wake-up, and the parent reads the round with `Ctx::child_status`, so
+  the lost-notice cases above hold for a round. A child without a conversation is unchanged.
+  **No agent reads a report yet.** `LlmAgent` drops it instead of making it a person's message, and `Ctx::arrived`
+  and the reopen-on-arrival rule do not count it, as they do not count a finished notice, so a report that lands
+  while a run finishes does not reopen it. Slices 2 and 3 make a report reopen a turn on purpose (decision 4).
+* `Runtime::list_sessions` lists a parent's sessions over `list_runs` with the conversation prefix: the latest
+  round of each with its state (`Working` or `Idle`) and how it ended (`Done`, `Failed`, `Cancelled`). A run counts
+  only if the session's round 1 exists with a parent, so a top-level run in a session-shaped conversation is not
+  listed, and a parent never sees another's (the prefix ends in `/s/`, so `ctx1` does not match `ctx10`).
+
+**What does not exist yet.** The tools (`subagent_start` and the others), `Conversation::session`, closing (so no
+`Closed` state), a reader of `adam.child.reported` in `LlmAgent` or the coder, `PendingWait::Session`, the limits,
+the cancel cascade, remote sessions and the A2A extension.
+
 ## Remote tasks: the same wait without a message
 
 A subagent on another A2A agent (`a2a:` in its file) is the same idea with one thing missing: nothing tells
