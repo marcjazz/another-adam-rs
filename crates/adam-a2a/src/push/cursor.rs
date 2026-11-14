@@ -10,7 +10,10 @@
 //! * **Status.** Identified by its state and a digest of its message, so a status that changes
 //!   only in its timestamp is not news.
 //! * **Artifacts.** Identified by `artifactId`. An artifact the webhook has been told about is
-//!   not sent again.
+//!   not sent again, unless it was replaced since (an artifact keeps its id when the run changes it,
+//!   as a plan does): the cursor then also holds a digest of the content the webhook was told, and
+//!   a different one is news. A cursor written before digests existed has none and treats a known
+//!   id as told.
 //! * **Pending.** An event that was sent and not acknowledged (the webhook answered 500, or did
 //!   not answer) is kept whole, so the retry sends *that* event even if the task has moved on
 //!   since: a webhook that was down for a while still hears each state it was meant to hear, in
@@ -21,6 +24,8 @@
 use a2a::{
     StreamResponse, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +40,10 @@ pub struct PushCursor {
     /// The artifacts delivered (or present when the config was created), by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// A digest of the content of each artifact delivered, by id: what tells an artifact that was
+    /// replaced under its id from one the webhook has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub revisions: BTreeMap<String, String>,
     /// The event being delivered: sent, not acknowledged, to be sent again as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<StreamResponse>,
@@ -68,6 +77,50 @@ fn state_name(state: &TaskState) -> String {
         .unwrap_or_default()
 }
 
+/// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
+/// the artifact under that id when it changes, so the same id can carry different content later. An
+/// artifact without it has an id made from its content (a different content is a different id),
+/// and a delivery cursor keeps nothing more about it than the id.
+pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
+
+/// Whether `artifact` is one whose id can carry different content later ([`REPLACEABLE_ARTIFACT`]).
+fn replaceable(artifact: &a2a::Artifact) -> bool {
+    artifact
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.contains_key(REPLACEABLE_ARTIFACT))
+}
+
+/// `value` with the members of every object in sorted order, whether or not this build of
+/// `serde_json` keeps insertion order.
+fn sorted(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().map(|(k, v)| (k, sorted(v))).collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
+        other => other,
+    }
+}
+
+/// The key that tells two contents of one artifact apart: a digest of its name and parts as
+/// canonical JSON (members of every object in sorted order), so the same artifact read back from the
+/// store, or written by another build, digests the same.
+fn revision(artifact: &a2a::Artifact) -> String {
+    let canonical = serde_json::to_value((&artifact.name, &artifact.parts))
+        .map(sorted)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default();
+    Sha256::digest(&canonical)
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl PushCursor {
     /// The cursor of a config created while the task is `task`: what the task already says is
     /// not news to the webhook, only what changes after.
@@ -79,6 +132,13 @@ impl PushCursor {
                 .iter()
                 .flatten()
                 .map(|a| a.artifact_id.clone())
+                .collect(),
+            revisions: task
+                .artifacts
+                .iter()
+                .flatten()
+                .filter(|a| replaceable(a))
+                .map(|a| (a.artifact_id.clone(), revision(a)))
                 .collect(),
             pending: None,
             failing_since: None,
@@ -93,12 +153,13 @@ impl PushCursor {
         if let Some(pending) = &self.pending {
             return Some(pending.clone());
         }
-        if let Some(artifact) = task
-            .artifacts
-            .iter()
-            .flatten()
-            .find(|a| !self.artifacts.contains(&a.artifact_id))
-        {
+        if let Some(artifact) = task.artifacts.iter().flatten().find(|a| {
+            !self.artifacts.contains(&a.artifact_id)
+                || self
+                    .revisions
+                    .get(&a.artifact_id)
+                    .is_some_and(|told| *told != revision(a))
+        }) {
             return Some(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                 task_id: task.id.clone(),
                 context_id: task.context_id.clone(),
@@ -127,6 +188,10 @@ impl PushCursor {
                 let id = &update.artifact.artifact_id;
                 if !self.artifacts.contains(id) {
                     self.artifacts.push(id.clone());
+                }
+                if replaceable(&update.artifact) {
+                    self.revisions
+                        .insert(id.clone(), revision(&update.artifact));
                 }
             }
             StreamResponse::Task(task) => *self = Self::baseline(task),
@@ -267,5 +332,119 @@ mod tests {
         assert_eq!(back, cursor);
         let empty: PushCursor = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(empty, PushCursor::default());
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    //! An artifact whose id is its own can change under it: the cursor tells it again when its
+    //! content differs from what the webhook was last told, and stores nothing for any other.
+    use std::collections::HashMap;
+
+    use a2a::{Artifact, Message, Part, Role};
+
+    use super::*;
+
+    fn artifact(id: &str, text: &str, replaceable: bool) -> Artifact {
+        Artifact {
+            artifact_id: id.to_owned(),
+            name: Some("plan".into()),
+            description: None,
+            parts: vec![Part::text(text)],
+            metadata: replaceable.then(|| {
+                HashMap::from([(REPLACEABLE_ARTIFACT.to_owned(), serde_json::json!(true))])
+            }),
+            extensions: None,
+        }
+    }
+
+    fn task_of(artifacts: Vec<Artifact>) -> Task {
+        Task {
+            id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: Some(Message::new(Role::Agent, vec![Part::text("w")])),
+                timestamp: None,
+            },
+            artifacts: Some(artifacts),
+            history: None,
+            metadata: None,
+        }
+    }
+
+    /// Deliver what the cursor says next until it says nothing; the texts of the artifacts told.
+    fn drain(cursor: &mut PushCursor, task: &Task) -> Vec<String> {
+        let mut told = Vec::new();
+        while let Some(event) = cursor.next_event(task) {
+            if let StreamResponse::ArtifactUpdate(update) = &event {
+                told.push(format!("{:?}", update.artifact.parts[0].content));
+            }
+            cursor.acknowledge(&event);
+        }
+        told
+    }
+
+    #[test]
+    fn a_replaced_artifact_is_told_again_and_a_change_back_is_told_too() {
+        let mut cursor = PushCursor::default();
+        let a = task_of(vec![artifact("plan-x", "A", true)]);
+        let b = task_of(vec![artifact("plan-x", "B", true)]);
+        assert_eq!(drain(&mut cursor, &a).len(), 1, "A is new");
+        assert!(drain(&mut cursor, &a).is_empty(), "A is not told twice");
+        assert_eq!(drain(&mut cursor, &b).len(), 1, "B replaced A");
+        assert_eq!(
+            drain(&mut cursor, &a).len(),
+            1,
+            "A again is a change from B"
+        );
+        assert!(drain(&mut cursor, &a).is_empty());
+        assert_eq!(cursor.artifacts, ["plan-x"], "one entry per id");
+        assert_eq!(cursor.revisions.len(), 1);
+    }
+
+    #[test]
+    fn an_artifact_with_no_id_of_its_own_stores_no_revision() {
+        let t = task_of(vec![
+            artifact("report-1", "r", false),
+            artifact("p", "A", true),
+        ]);
+        let baseline = PushCursor::baseline(&t);
+        assert_eq!(baseline.artifacts.len(), 2);
+        assert_eq!(baseline.revisions.keys().collect::<Vec<_>>(), ["p"]);
+        let mut cursor = PushCursor::default();
+        drain(&mut cursor, &t);
+        assert_eq!(cursor.revisions.keys().collect::<Vec<_>>(), ["p"]);
+    }
+
+    #[test]
+    fn a_cursor_stored_before_revisions_treats_a_known_id_as_told_and_hears_the_next_change() {
+        // What an older worker wrote: the id, and no revisions.
+        let stored = r#"{"artifacts": ["plan-x"]}"#;
+        let mut cursor: PushCursor = serde_json::from_str(stored).unwrap();
+        let a = task_of(vec![artifact("plan-x", "A", true)]);
+        let b = task_of(vec![artifact("plan-x", "B", true)]);
+        assert!(drain(&mut cursor, &a).is_empty(), "a known id is told");
+        assert_eq!(
+            drain(&mut cursor, &b).len(),
+            0,
+            "and with nothing recorded, so is B"
+        );
+        // Once a delivery records a revision, a later change is told.
+        cursor.artifacts.clear();
+        assert_eq!(drain(&mut cursor, &b).len(), 1);
+        assert_eq!(drain(&mut cursor, &a).len(), 1);
+    }
+
+    #[test]
+    fn the_digest_does_not_depend_on_the_order_of_a_data_parts_members() {
+        let with = |data: serde_json::Value| Artifact {
+            parts: vec![Part::data(data)],
+            ..artifact("p", "", true)
+        };
+        assert_eq!(
+            revision(&with(serde_json::json!({"a": 1, "b": {"c": 2, "d": 3}}))),
+            revision(&with(serde_json::json!({"b": {"d": 3, "c": 2}, "a": 1})))
+        );
     }
 }

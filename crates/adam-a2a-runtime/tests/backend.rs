@@ -156,6 +156,7 @@ impl Agent for Scripted {
                 .to_owned();
             state["pending_question"] = Value::Null;
             ctx.emit(RunEvent::Artifact {
+                id: None,
                 name: "answer".into(),
                 mime_type: Some("text/plain".into()),
                 data: json!(answer),
@@ -167,12 +168,51 @@ impl Agent for Scripted {
                 output: json!({"text": format!("answered: {answer}")}),
             });
         }
+        if text.contains("[flip]") {
+            // A, then B, then A again, all under one id.
+            if let Some(v) = ["A", "B", "A"].get(usize::try_from(phase).unwrap_or(3)) {
+                ctx.emit(RunEvent::Artifact {
+                    id: Some("plan-x".into()),
+                    name: "plan".into(),
+                    mime_type: None,
+                    data: json!({"v": v}),
+                    file: None,
+                })
+                .await;
+                state["phase"] = json!(phase + 1);
+                return Ok(Transition::Continue(state));
+            }
+            return Ok(Transition::Done {
+                state,
+                output: json!({"text": "finished"}),
+            });
+        }
+        if text.contains("[plan]") {
+            // A thing that changes while the run works: three drawings, one id.
+            if phase < 3 {
+                ctx.emit(RunEvent::Artifact {
+                    id: Some("plan-x".into()),
+                    name: "plan".into(),
+                    mime_type: None,
+                    data: json!({"v": phase}),
+                    file: None,
+                })
+                .await;
+                state["phase"] = json!(phase + 1);
+                return Ok(Transition::Continue(state));
+            }
+            return Ok(Transition::Done {
+                state,
+                output: json!({"text": "finished"}),
+            });
+        }
         if phase == 0 {
             ctx.emit(RunEvent::Progress {
                 message: "working".into(),
             })
             .await;
             ctx.emit(RunEvent::Artifact {
+                id: None,
                 name: "report".into(),
                 mime_type: Some("text/markdown".into()),
                 data: json!("# done"),
@@ -498,6 +538,127 @@ async fn a_shared_file_is_a_raw_part_in_the_stream_and_in_the_task() {
         .find(|a| a.name.as_deref() == Some("logo"))
         .expect("the file is on the task");
     assert_eq!(kept, &streamed[0], "the same artifact, id included");
+}
+
+/// An artifact with an id of its own is one artifact however often it changes: the task lists it
+/// once, holding the newest, and each change is sent under that id with no `append`, which in A2A
+/// replaces the artifact with that id.
+#[tokio::test]
+async fn an_artifact_with_an_id_is_replaced_in_the_task_and_in_the_stream() {
+    use a2a::PartContent;
+
+    let rig = Rig::new();
+    let task = rig
+        .backend
+        .submit(alice(), user("[plan] draw it three times"), None, None)
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    worker.stop().await;
+
+    let streamed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TaskEvent::Artifact(u) if u.artifact.name.as_deref() == Some("plan") => Some(u),
+            _ => None,
+        })
+        .collect();
+    assert!(!streamed.is_empty(), "{events:?}");
+    for update in &streamed {
+        assert_eq!(update.artifact.artifact_id, "plan-x");
+        assert_eq!(update.append, None, "an update with no `append` replaces");
+        assert_eq!(update.last_chunk, Some(true));
+    }
+    // Each drawing is said once, and the last is the newest.
+    let drawings: Vec<_> = streamed
+        .iter()
+        .map(|u| u.artifact.parts[0].content.clone())
+        .collect();
+    let mut once = drawings.clone();
+    once.dedup();
+    assert_eq!(drawings, once, "no drawing twice: {drawings:?}");
+    assert_eq!(
+        drawings.last(),
+        Some(&PartContent::Data(json!({"v": 2}))),
+        "{drawings:?}"
+    );
+
+    let done = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    let plans: Vec<_> = done
+        .artifacts
+        .expect("artifacts on the task")
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("plan"))
+        .collect();
+    assert_eq!(plans.len(), 1, "one artifact on the task: {plans:?}");
+    assert_eq!(plans[0].artifact_id, "plan-x");
+    assert_eq!(
+        plans[0].parts[0].content,
+        PartContent::Data(json!({"v": 2}))
+    );
+}
+
+/// A, then B, then A again under one id: the third is a change from what the client holds (B), so
+/// it is sent, and the client ends with what `GetTask` says. A client that subscribes afterwards
+/// is told the newest content once, in the snapshot.
+#[tokio::test]
+async fn a_change_back_to_an_earlier_content_under_one_id_is_sent() {
+    use a2a::PartContent;
+
+    let rig = Rig::new();
+    let task = rig
+        .backend
+        .submit(alice(), user("[flip] A, B, A"), None, None)
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    let contents: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TaskEvent::Artifact(u) if u.artifact.name.as_deref() == Some("plan") => {
+                Some(u.artifact.parts[0].content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let said = |v: &str| PartContent::Data(json!({ "v": v }));
+    assert_eq!(contents, [said("A"), said("B"), said("A")], "{events:?}");
+
+    let done = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    let plans: Vec<_> = done
+        .artifacts
+        .clone()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("plan"))
+        .collect();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].parts[0].content, said("A"));
+    // Subscribing now: the snapshot, with the newest content once, and no artifact event after it.
+    let mut late = rig.backend.subscribe(&alice(), &task.id);
+    let TaskEvent::Snapshot(snapshot) = next(&mut late).await else {
+        panic!("the first event is the snapshot");
+    };
+    let in_snapshot: Vec<_> = snapshot
+        .artifacts
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("plan"))
+        .collect();
+    assert_eq!(in_snapshot.len(), 1);
+    assert_eq!(in_snapshot[0].parts[0].content, said("A"));
+    let after = rest(&mut late).await;
+    assert!(
+        after.iter().all(|e| !matches!(e, TaskEvent::Artifact(_))),
+        "{after:?}"
+    );
+    worker.stop().await;
 }
 
 #[tokio::test]

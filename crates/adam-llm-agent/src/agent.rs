@@ -26,6 +26,7 @@ use crate::conversation::{
 };
 use crate::history::fit_history;
 use crate::paging::backstop;
+use crate::plan::Plan;
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
 };
@@ -1267,7 +1268,11 @@ impl LlmAgent {
                 .run_tool(
                     ctx,
                     &state.context,
-                    (state.root_run, state.root_step.as_deref()),
+                    (
+                        state.root_run,
+                        state.root_step.as_deref(),
+                        state.plan.as_ref(),
+                    ),
                     &state.source_notes,
                     &call,
                     CallFacts {
@@ -1283,11 +1288,15 @@ impl LlmAgent {
                     artifacts,
                     answer,
                     repeat_key,
+                    plan,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
                     }
                     record_answer(state, key, &message, repeat_key);
+                    if let Some(plan) = plan {
+                        state.plan = Some(*plan);
+                    }
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
@@ -1377,7 +1386,7 @@ impl LlmAgent {
                 }
             };
             state.messages.push(message);
-            state.artifacts.extend(artifacts);
+            add_artifact_refs(&mut state.artifacts, artifacts);
             state.pending_calls.remove(0);
         }
         Ok(Flow::Next)
@@ -1388,7 +1397,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: &Map<String, Value>,
-        root: (Option<RunId>, Option<&str>),
+        root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -1434,6 +1443,7 @@ impl LlmAgent {
                 artifacts: Vec::new(),
                 answer: None,
                 repeat_key: None,
+                plan: None,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1508,6 +1518,7 @@ impl LlmAgent {
                     artifacts: Vec::new(),
                     answer: None,
                     repeat_key: None,
+                    plan: None,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1559,7 +1570,7 @@ impl LlmAgent {
         let answered = match outcome {
             Ok(output) => {
                 let repeat_key = output.repeat_key.as_deref().cloned();
-                let (message, artifacts, answer, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome) = output_message(
                     ctx,
                     &call.id,
                     &call.name,
@@ -1586,6 +1597,7 @@ impl LlmAgent {
                     artifacts,
                     answer,
                     repeat_key,
+                    plan,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1609,6 +1621,7 @@ impl LlmAgent {
                     artifacts: Vec::new(),
                     answer: None,
                     repeat_key: None,
+                    plan: None,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -1658,7 +1671,7 @@ impl LlmAgent {
         &self,
         ctx: &Ctx,
         context: &Map<String, Value>,
-        (root_run, root_step): (Option<RunId>, Option<&str>),
+        (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -1678,6 +1691,7 @@ impl LlmAgent {
             self.style_of(tool, notes)
                 .event(tool, call_id, StepState::Running),
         )
+        .with_plan(plan.cloned())
     }
 
     /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`]; for a
@@ -1829,7 +1843,11 @@ impl LlmAgent {
             .tool_ctx(
                 ctx,
                 &state.context,
-                (state.root_run, state.root_step.as_deref()),
+                (
+                    state.root_run,
+                    state.root_step.as_deref(),
+                    state.plan.as_ref(),
+                ),
                 &state.source_notes,
                 &wait.call_id,
                 &wait.tool,
@@ -1847,7 +1865,7 @@ impl LlmAgent {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome) = output_message(
                     ctx,
                     &wait.call_id,
                     &wait.tool,
@@ -1856,9 +1874,12 @@ impl LlmAgent {
                     used,
                 )
                 .await;
-                state.artifacts.extend(artifacts);
+                add_artifact_refs(&mut state.artifacts, artifacts);
                 if let Some(answer) = answer {
                     state.announce(answer);
+                }
+                if let Some(plan) = plan {
+                    state.plan = Some(*plan);
                 }
                 owed(state, message);
                 Ok(Some(outcome))
@@ -1891,6 +1912,25 @@ impl LlmAgent {
     }
 }
 
+/// `new` added to `refs`: after the others, except one with an id that one of them has, which
+/// takes its place where it stands (the run holds one artifact for an id, see
+/// [`Artifact::id`](adam_runtime::Artifact::id)). A reference to a file (it has `bytes`) is never
+/// replaced and never replaces: the runtime keeps both, so the bytes count once each.
+fn add_artifact_refs(refs: &mut Vec<ArtifactRef>, new: Vec<ArtifactRef>) {
+    for mut one in new {
+        if one.bytes.is_some() {
+            one.id = None;
+        }
+        match one.id.as_ref().and_then(|id| {
+            refs.iter_mut()
+                .find(|r| r.bytes.is_none() && r.id.as_ref() == Some(id))
+        }) {
+            Some(held) => *held = one,
+            None => refs.push(one),
+        }
+    }
+}
+
 /// The bytes of the files the run has shared so far, by the references the state keeps.
 fn files_kept(artifacts: &[ArtifactRef]) -> u64 {
     artifacts.iter().filter_map(|a| a.bytes).sum()
@@ -1912,7 +1952,13 @@ async fn output_message(
     paged: bool,
     mut output: ToolOutput,
     files_used: u64,
-) -> (Message, Vec<ArtifactRef>, Option<Announcement>, StepState) {
+) -> (
+    Message,
+    Vec<ArtifactRef>,
+    Option<Announcement>,
+    Option<Box<Plan>>,
+    StepState,
+) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
     output.artifacts.retain(|a| {
@@ -1946,6 +1992,7 @@ async fn output_message(
         .artifacts
         .iter()
         .map(|a| ArtifactRef {
+            id: a.id.clone().filter(|_| a.file.is_none()),
             name: a.name.clone(),
             mime_type: a.mime_type.clone(),
             bytes: a.file.as_ref().map(|f| f.bytes.len() as u64),
@@ -1960,6 +2007,7 @@ async fn output_message(
         .take()
         .filter(|_| !output.is_error)
         .map(|text| Announcement { text, ends_turn });
+    let plan = output.plan.take().filter(|_| !output.is_error);
     let message = Message::Tool {
         call_id: call_id.to_owned(),
         // After the journal: the journal holds the whole output, and the cut (which the history, the
@@ -1967,7 +2015,7 @@ async fn output_message(
         content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
     };
-    (message, refs, answer, outcome)
+    (message, refs, answer, plan, outcome)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -2097,6 +2145,8 @@ enum ToolResult {
         answer: Option<Announcement>,
         /// What the tool said makes this answer equal to another of the same call (`doom_loop`).
         repeat_key: Option<String>,
+        /// The plan the tool returned, from a result that is not an error.
+        plan: Option<Box<Plan>>,
     },
     NeedsInput {
         question: String,
@@ -2691,5 +2741,58 @@ mod failure_tests {
         let back: ModelFailure =
             serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
         assert_eq!(back.class, new.class);
+    }
+}
+
+#[cfg(test)]
+mod artifact_ref_tests {
+    use super::*;
+
+    fn reference(name: &str, id: Option<&str>, bytes: Option<u64>) -> ArtifactRef {
+        ArtifactRef {
+            id: id.map(str::to_owned),
+            name: name.to_owned(),
+            mime_type: None,
+            bytes,
+        }
+    }
+
+    fn names(refs: &[ArtifactRef]) -> Vec<&str> {
+        refs.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_replaced_reference_keeps_its_position() {
+        let mut refs = vec![
+            reference("x", None, None),
+            reference("plan", Some("p"), None),
+            reference("y", None, None),
+        ];
+        add_artifact_refs(&mut refs, vec![reference("plan2", Some("p"), None)]);
+        assert_eq!(names(&refs), ["x", "plan2", "y"]);
+    }
+
+    #[test]
+    fn two_of_one_id_in_one_call_are_one_entry_with_the_second() {
+        let mut refs = vec![reference("x", None, None)];
+        add_artifact_refs(
+            &mut refs,
+            vec![
+                reference("a", Some("p"), None),
+                reference("b", Some("p"), None),
+            ],
+        );
+        assert_eq!(names(&refs), ["x", "b"]);
+    }
+
+    #[test]
+    fn a_file_reference_never_replaces_and_is_never_replaced() {
+        let mut refs = vec![reference("plan", Some("p"), None)];
+        add_artifact_refs(&mut refs, vec![reference("logo", Some("p"), Some(10))]);
+        assert_eq!(names(&refs), ["plan", "logo"], "both kept");
+        assert_eq!(refs[1].id, None);
+        assert_eq!(files_kept(&refs), 10, "the bytes count once");
+        add_artifact_refs(&mut refs, vec![reference("plan2", Some("p"), None)]);
+        assert_eq!(names(&refs), ["plan2", "logo"]);
     }
 }

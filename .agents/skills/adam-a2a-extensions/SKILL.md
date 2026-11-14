@@ -53,7 +53,15 @@ read the exact strings in the file at your rev.
    the card first and send only what it declares. Every method (poll, cancel, resubscribe) carries
    its own header.
 2. **What the agent does** per extension: `adam-ui` (`crates/adam-ui/README.md`) reads the
-   screen's catalog and the thread tools and offers `ask_user`, `show`, `ui_catalog`;
+   screen's catalog and the thread tools and offers `ask_user`, `show`, `ui_catalog` and the plan tools
+   (`plan_work`, `plan_check`, `plan_add`; each call draws the plan as one surface `plan-<12 hex digits of a hash of the
+   conversation id>`, the same for the whole conversation, decided from the catalog alone: a `Checklist` when the catalog
+   validates one, else a `Column` of `Text`s, else no surface. The plan is **one artifact** (its `artifactId` is the surface
+   id; each change is an artifact update with that id and no `append`, which replaces it). The client rule, written by the
+   orchestration layer's UI catalog version 8 and *unverified* against the published page, 2026-11-14: a `createSurface`
+   for a surface that exists starts it over, and a surface whose id starts with `plan-` (plus at least one character) is a
+   plan, drawn from its newest copy (where a screen draws it is the screen's rule), which may hold no form, input or
+   button);
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
    (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
    running task": a message to a finished task is `UnsupportedOperation`, `-32004`; to a working

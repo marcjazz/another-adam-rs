@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 use adam_a2a::A2UI_MEDIA_TYPE;
+use adam_a2a::push::REPLACEABLE_ARTIFACT;
 use adam_core::RunStatus;
 use adam_runtime::{Inbound, RunView};
 use serde_json::{Value, json};
@@ -311,7 +312,10 @@ pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
         name: Some(artifact.name.clone()),
         description: None,
         parts,
-        metadata: None,
+        metadata: artifact
+            .id
+            .is_some()
+            .then(|| HashMap::from([(REPLACEABLE_ARTIFACT.to_owned(), json!(true))])),
         extensions: None,
     }
 }
@@ -325,11 +329,34 @@ fn link_of(data: &Value) -> Option<&str> {
     (!rest.is_empty() && !url.chars().any(char::is_whitespace)).then_some(url)
 }
 
+/// The A2A id of a run artifact: the id it was given ([`adam_runtime::Artifact::id`]), else the
+/// content-derived `<name>-<12 hex digits>`.
+///
+/// An artifact with an id of its own is **one artifact however often it changes**: the run holds
+/// the newest, the task lists it once, and the stream sends each change under that id with no
+/// `append`, which in A2A replaces the artifact with that id on the client.
+pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
+    artifact.id.clone().unwrap_or_else(|| derived_id(artifact))
+}
+
+/// Where a subscriber's memory of an artifact is kept, and what it holds: `(slot, content)`. The
+/// slot is the artifact's id when it has one, so the subscriber remembers **the last content it was
+/// sent under that id** (one entry per id, however often it changes, and a change back to an earlier
+/// content is a change); an artifact with no id has its content-derived id for a slot, and is said
+/// once.
+pub(crate) fn artifact_slot(artifact: &adam_runtime::Artifact) -> (String, String) {
+    let content = derived_id(artifact);
+    (
+        artifact.id.clone().unwrap_or_else(|| content.clone()),
+        content,
+    )
+}
+
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
 ///
 /// For a file the digest covers its filename and the digest of its bytes, so two files that differ
 /// by one byte have two ids and the same file twice has one.
-pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
+fn derived_id(artifact: &adam_runtime::Artifact) -> String {
     let digest = match &artifact.file {
         Some(file) => Sha256::digest(
             serde_json::to_vec(&(

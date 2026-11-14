@@ -833,7 +833,9 @@ fn build_update(
         _ => wake_at,
     };
     let mut artifacts = cur.artifacts.clone();
-    artifacts.extend(next.artifacts.iter().cloned());
+    for artifact in &next.artifacts {
+        add_artifact(&mut artifacts, artifact);
+    }
     let env = Envelope {
         v: cur.v,
         agent: next.agent.clone(),
@@ -857,6 +859,27 @@ fn build_update(
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;
     Ok(update)
+}
+
+/// `artifact` added to the run's `artifacts`: after the others, unless it has an id
+/// ([`Artifact::id`]) that one of them has, which it replaces where it stands (so a position is
+/// kept). A file artifact is never replaced and never replaces anything: files are content-addressed
+/// and have no id, so an id on one is dropped and both are kept. Journaled artifacts with no id never
+/// match, so a run written before ids existed reads and grows as it did.
+fn add_artifact(artifacts: &mut Vec<Artifact>, artifact: &Artifact) {
+    let mut artifact = artifact.clone();
+    if artifact.file.is_some() {
+        artifact.id = None;
+    }
+    if let Some(id) = &artifact.id
+        && let Some(held) = artifacts
+            .iter_mut()
+            .find(|held| held.file.is_none() && held.id.as_deref() == Some(id.as_str()))
+    {
+        *held = artifact;
+        return;
+    }
+    artifacts.push(artifact);
 }
 
 /// Whether a `Done` is committed as a step that goes on: the agent asked for it
@@ -942,4 +965,78 @@ async fn announce(inner: &Inner, committed: &RunRecord, next: &Next) {
     inner
         .emit_status(committed.id, &committed.agent, status, detail)
         .await;
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn made(name: &str, id: Option<&str>, data: i32) -> Artifact {
+        let mut artifact = Artifact::new(name, None, json!(data));
+        artifact.id = id.map(str::to_owned);
+        artifact
+    }
+
+    fn names(artifacts: &[Artifact]) -> Vec<(String, i64)> {
+        artifacts
+            .iter()
+            .map(|a| (a.name.clone(), a.data.as_i64().unwrap_or(-1)))
+            .collect()
+    }
+
+    #[test]
+    fn a_replaced_artifact_keeps_its_position() {
+        let mut held = vec![
+            made("x", None, 1),
+            made("plan", Some("p"), 1),
+            made("y", None, 1),
+        ];
+        add_artifact(&mut held, &made("plan", Some("p"), 2));
+        assert_eq!(
+            names(&held),
+            [("x".into(), 1), ("plan".into(), 2), ("y".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn two_of_one_id_in_one_transition_are_one_entry_with_the_second_content() {
+        let mut held = vec![made("x", None, 1)];
+        for artifact in [made("plan", Some("p"), 1), made("plan", Some("p"), 2)] {
+            add_artifact(&mut held, &artifact);
+        }
+        assert_eq!(names(&held), [("x".into(), 1), ("plan".into(), 2)]);
+    }
+
+    #[test]
+    fn an_artifact_without_an_id_is_always_added() {
+        let mut held = vec![];
+        add_artifact(&mut held, &made("a", None, 1));
+        add_artifact(&mut held, &made("a", None, 1));
+        assert_eq!(held.len(), 2);
+    }
+
+    #[test]
+    fn a_file_never_replaces_and_is_never_replaced() {
+        let mut held = vec![made("plan", Some("p"), 1)];
+        let mut file = Artifact::file("logo", "image/png", "l.png", vec![1, 2, 3]).unwrap();
+        file.id = Some("p".into());
+        add_artifact(&mut held, &file);
+        assert_eq!(held.len(), 2, "the plan stays and the file is kept");
+        assert_eq!(held[0].data, json!(1));
+        assert_eq!(held[1].id, None, "an id on a file is dropped");
+        // with_id leaves a file without one.
+        assert_eq!(
+            Artifact::file("logo", "image/png", "l.png", vec![1])
+                .unwrap()
+                .with_id("p")
+                .id,
+            None
+        );
+        // A plan with the same id still replaces the plan, and not the file.
+        add_artifact(&mut held, &made("plan", Some("p"), 2));
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].data, json!(2));
+    }
 }

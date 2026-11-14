@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -249,6 +250,14 @@ pub struct ToolOutput {
     /// it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_key: Option<Box<String>>,
+    /// The conversation's plan as it is after this call ([`Plan`]): the whole plan, not a change.
+    /// The loop makes it the run's plan when the result is not an error, in the same commit as the
+    /// result; a replay takes it from the journal. Read the plan a call starts from with
+    /// [`ToolCtx::plan`]. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Box<Plan>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -266,6 +275,7 @@ impl ToolOutput {
             ends_turn: false,
             sandbox: SandboxUsage::new(),
             repeat_key: None,
+            plan: None,
         }
     }
 
@@ -280,6 +290,7 @@ impl ToolOutput {
             ends_turn: false,
             sandbox: SandboxUsage::new(),
             repeat_key: None,
+            plan: None,
         }
     }
 
@@ -320,6 +331,14 @@ impl ToolOutput {
     #[must_use]
     pub fn with_repeat_key(mut self, key: impl Into<String>) -> Self {
         self.repeat_key = Some(Box::new(key.into()));
+        self
+    }
+
+    /// Make `plan` the conversation's plan, when this result is not an error: see
+    /// [`plan`](Self::plan).
+    #[must_use]
+    pub fn with_plan(mut self, plan: Plan) -> Self {
+        self.plan = Some(Box::new(plan));
         self
     }
 
@@ -500,6 +519,20 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
+    /// The conversation's plan as the call starts ([`plan`](Self::plan)).
+    plan: Option<Arc<Plan>>,
+    /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
+    scrub: Option<Scrubber>,
+}
+
+/// A function from a text to the same text with its secrets replaced.
+#[derive(Clone)]
+struct Scrubber(Arc<dyn Fn(&str) -> String + Send + Sync>);
+
+impl std::fmt::Debug for Scrubber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scrubber")
+    }
 }
 
 impl ToolCtx {
@@ -536,7 +569,49 @@ impl ToolCtx {
             note: None,
             files_left: MAX_RUN_FILE_BYTES as u64,
             sandbox: Arc::default(),
+            plan: None,
+            scrub: None,
         }
+    }
+
+    /// Give the call a function that scrubs secrets out of a text. A layer that scrubs the results
+    /// of the tools it wraps (the coder's `Redacting`) sets it, so a tool can scrub **before** it
+    /// cuts, truncates, hashes or splits a text it makes: a secret cut in half is no longer a secret
+    /// the scrubber recognises, and the half that is left is durable. See [`scrub`](Self::scrub).
+    #[must_use]
+    pub fn with_scrub(mut self, scrub: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.scrub = Some(Scrubber(Arc::new(scrub)));
+        self
+    }
+
+    /// `text` with its secrets replaced, as the layer around this tool would; `text` itself when
+    /// there is no such layer.
+    ///
+    /// **The rule for a tool that shortens a text it puts in its result** (a label cut to a
+    /// limit, a line cut to a width): call this on the whole text first, then shorten what it
+    /// returns. The layer scrubs the finished result as well, but only a secret still whole in it.
+    pub fn scrub(&self, text: &str) -> String {
+        match &self.scrub {
+            Some(scrubber) => (scrubber.0)(text),
+            None => text.to_owned(),
+        }
+    }
+
+    /// Give the call the plan the conversation has when it starts: what [`plan`](Self::plan)
+    /// answers. The agent does it for every call; a test of a plan tool does it to say what the
+    /// plan was.
+    #[must_use]
+    pub fn with_plan(mut self, plan: impl Into<Option<Plan>>) -> Self {
+        self.plan = plan.into().map(Arc::new);
+        self
+    }
+
+    /// The conversation's plan as this call starts: the one a tool before it in the same turn left,
+    /// since calls run one after the other. `None` while there is none. Return the new plan with
+    /// [`ToolOutput::with_plan`]; this value is a copy, and changing nothing here changes nothing
+    /// there.
+    pub fn plan(&self) -> Option<&Plan> {
+        self.plan.as_deref()
     }
 
     /// Say how many bytes of files the run may still share: what [`files_left`](Self::files_left)

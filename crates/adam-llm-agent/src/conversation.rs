@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::plan::Plan;
 use crate::source::ToolNote;
 
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
@@ -192,6 +193,11 @@ impl PendingWait {
 /// lives in `RunView::artifacts`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactRef {
+    /// The id the artifact is kept under, if it has one ([`Artifact::id`](adam_runtime::Artifact::id)):
+    /// a later artifact with the same id replaces this one in the list. Absent from state written
+    /// before ids existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Artifact name.
     pub name: String,
     /// Media type, if known.
@@ -335,6 +341,13 @@ pub struct Conversation {
     /// with it. Absent from state written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced_final: bool,
+    /// The plan of the conversation ([`Plan`]): written by a tool with
+    /// [`ToolOutput::with_plan`](crate::ToolOutput::with_plan), applied only from a result that is not
+    /// an error, and carried into a run that continues this one. It is never put in the system
+    /// prompt, and no earlier message is rewritten with it. Absent from state written before it
+    /// existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.
@@ -842,6 +855,7 @@ impl Conversation {
             omitted_turns,
             continued_from: Some(from),
             context: self.context.clone(),
+            plan: self.plan.clone(),
             ..Self::default()
         }
     }
@@ -1119,6 +1133,7 @@ mod tests {
         prior.tool_calls = 5;
         prior.usage = Usage::new(10, 20);
         prior.artifacts = vec![ArtifactRef {
+            id: None,
             name: "report".into(),
             mime_type: None,
             bytes: None,

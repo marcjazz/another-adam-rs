@@ -15,7 +15,7 @@
 //! | `rebuild_environment { use_default? }` | [`environment`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
-//! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}` | [`adam_ui`]: the person's screen as tools |
+//! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}`, `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | [`adam_ui`]: the person's screen as tools, and the plan |
 //!
 //! # Retry safety
 //!
@@ -722,7 +722,8 @@ pub(crate) fn resolve_slot(
 }
 
 /// Every coder tool, in the order they are offered to the model: the twenty of the coding workflow,
-/// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
+/// then the screen's and the plan's (`ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`,
+/// `plan_add`, from [`ToolEnv::ui`]).
 ///
 /// `create_repository` is offered only when the deployment lets it create repositories for someone
 /// ([`CoderSettings::can_create_repositories`]: `CREATE_REPO_OWNERS` names owners, or the credentials
@@ -874,7 +875,7 @@ const LIMIT_MARGIN: Duration = Duration::from_secs(30);
 /// and display tools. Any other tool of the coder must have a bound of its own and declare it in
 /// `own_limit`: a tool added later is not on this list, so it decides. A test walks the whole tool
 /// list (`tests/time_limits.rs`).
-pub const QUICK_TOOLS: [&str; 13] = [
+pub const QUICK_TOOLS: [&str; 16] = [
     // The run's own files: `apply_patch` runs `git apply` for at most 60 s. (The four read tools,
     // `read_file`, `list_files`, `find_files` and `search_files`, have a deadline of their own, 30 s:
     // they declare it, see `own_limit`.)
@@ -894,6 +895,10 @@ pub const QUICK_TOOLS: [&str; 13] = [
     "ask_user",
     "show",
     "ui_catalog",
+    // The plan: state the loop keeps, drawn on the screen of the catalog the message carried.
+    "plan_work",
+    "plan_check",
+    "plan_add",
 ];
 
 /// The time limit a coder tool declares: its own bound and [`LIMIT_MARGIN`], from the deployment's
@@ -965,9 +970,23 @@ impl Tool for Redacting {
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let r = &self.redactor;
-        match self.inner.call(ctx, args).await {
+        // The tool may scrub what it is about to cut: a secret cut in half escapes the scrub below.
+        let hook = r.clone();
+        let hooked = ctx
+            .clone()
+            .with_scrub(move |text| hook.scrub(text).into_owned());
+        match self.inner.call(&hooked, args).await {
             Ok(mut out) => {
                 out.content = r.scrub_string(out.content);
+                // The plan is state the loop keeps and the next plan call prints: it is scrubbed
+                // like the words that were printed from it.
+                if let Some(plan) = &mut out.plan {
+                    plan.title = plan.title.take().map(|t| r.scrub_string(t));
+                    for item in &mut plan.items {
+                        item.text = r.scrub_string(std::mem::take(&mut item.text));
+                        item.note = item.note.take().map(|n| r.scrub_string(n));
+                    }
+                }
                 for artifact in &mut out.artifacts {
                     r.scrub_value(&mut artifact.data);
                     // A text file may hold what the process knows to hide (a token a command
@@ -1348,5 +1367,64 @@ mod grant_tests {
             full.said("word0")
                 && !full.said(&format!("word{}", crate::tools::notes::MAX_SAID_WORDS + 10))
         );
+    }
+}
+
+#[cfg(test)]
+mod redacting_tests {
+    //! What the redaction layer does to a plan a tool returns, whichever tool it is.
+
+    use adam_llm_agent::{Plan, PlanItem, PlanStatus};
+    use adam_runtime::CollectingSink;
+
+    use super::*;
+
+    const TOKEN: &str = "Zq9#kL2mWx7RvT4pNc8YbH1sJd5FgA3eUo6iXz0Q";
+
+    /// Returns a plan that holds the secret everywhere it can, and a line made with the hook its
+    /// context carries.
+    struct Planner;
+
+    #[async_trait::async_trait]
+    impl Tool for Planner {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "planner".to_owned(),
+                description: "test".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            let item = |id, text: &str, note: Option<&str>| PlanItem {
+                id,
+                text: text.to_owned(),
+                status: PlanStatus::Pending,
+                note: note.map(str::to_owned),
+            };
+            let plan = Plan {
+                title: Some(format!("T {TOKEN}")),
+                items: vec![
+                    item(1, &format!("use {TOKEN}"), Some(TOKEN)),
+                    item(2, "plain", None),
+                ],
+            };
+            Ok(ToolOutput::text(ctx.scrub(&format!("hook: {TOKEN}"))).with_plan(plan))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_plan_a_tool_returns_is_scrubbed_and_the_tool_is_given_the_hook() {
+        let redactor = Redactor::default();
+        redactor.add(TOKEN);
+        let tool = Redacting::layer(redactor)(Arc::new(Planner));
+        let ctx = ToolCtx::detached("planner", "c1", Arc::new(CollectingSink::new()));
+        let out = tool.call(&ctx, serde_json::json!({})).await.unwrap();
+        assert_eq!(out.content, "hook: [redacted]");
+        let plan = out.plan.unwrap();
+        assert_eq!(plan.title.as_deref(), Some("T [redacted]"));
+        assert_eq!(plan.items[0].text, "use [redacted]");
+        assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"));
+        assert_eq!(plan.items[1].text, "plain");
     }
 }

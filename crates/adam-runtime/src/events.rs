@@ -111,6 +111,16 @@ mod base64_bytes {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Artifact {
+    /// The artifact's identity within the run, when it has one: **a later artifact of the run with
+    /// the same id replaces it, whichever tool made it**, in place (it keeps its position) instead of
+    /// being added after it, so a thing that changes while a run works (a plan, a surface) is one
+    /// artifact, not one per change. `None` (artifacts journaled before ids existed, and every
+    /// artifact that is only ever made once) is not replaced by anything. **Files have no id**: a
+    /// file artifact is content-addressed ([ADR 0012](../../../docs/decisions/0012-files-as-a2a-artifacts.md)),
+    /// so [`with_id`](Self::with_id) leaves a file without one, and the run never replaces a file nor
+    /// replaces anything with a file (an id on a file is dropped, both are kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Artifact name.
     pub name: String,
     /// Media type of `data` (or of the file), if known.
@@ -126,11 +136,21 @@ impl Artifact {
     /// A JSON artifact: `data` with its media type, if it has one.
     pub fn new(name: impl Into<String>, mime_type: Option<String>, data: Value) -> Self {
         Self {
+            id: None,
             name: name.into(),
             mime_type,
             data,
             file: None,
         }
+    }
+
+    /// Keep this artifact under `id`: see [`id`](Self::id). A file artifact stays without one.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        if self.file.is_none() {
+            self.id = Some(id.into());
+        }
+        self
     }
 
     /// A file artifact: `bytes`, saved as `filename`, of `media_type`.
@@ -166,6 +186,7 @@ impl Artifact {
             return Err(ArtifactFileError::BadMediaType(media_type));
         }
         Ok(Self {
+            id: None,
             name: name.into(),
             mime_type: Some(media_type),
             data: Value::Null,
@@ -300,6 +321,9 @@ pub enum RunEvent {
     /// An output of the run. Also recorded durably with the next commit, so
     /// it survives restarts in `RunView::artifacts`.
     Artifact {
+        /// The id the artifact is kept under, if it has one (see [`Artifact::id`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         /// Artifact name.
         name: String,
         /// Media type of `data` (or of the file), if known.
@@ -316,6 +340,7 @@ pub enum RunEvent {
 impl From<Artifact> for RunEvent {
     fn from(a: Artifact) -> Self {
         Self::Artifact {
+            id: a.id,
             name: a.name,
             mime_type: a.mime_type,
             data: a.data,
@@ -667,6 +692,7 @@ mod tests {
                 payload: serde_json::json!({"a": 1}),
             },
             RunEvent::Artifact {
+                id: None,
                 name: "report".into(),
                 mime_type: Some("text/plain".into()),
                 data: serde_json::json!("x"),
@@ -833,6 +859,7 @@ mod tests {
         assert_eq!(
             event,
             RunEvent::Artifact {
+                id: None,
                 name: "n".into(),
                 mime_type: None,
                 data: serde_json::json!("x"),

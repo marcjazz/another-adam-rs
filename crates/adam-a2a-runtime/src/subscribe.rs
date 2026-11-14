@@ -1,6 +1,6 @@
 //! Replayable subscriptions: durable polling merged with live events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use a2a::{
@@ -19,7 +19,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
-use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
+use crate::convert::{
+    StatusKey, artifact_of, artifact_slot, status_key, status_of, task_from_view,
+};
 use crate::steps::step_message;
 use crate::text_stream;
 use crate::tier;
@@ -58,7 +60,8 @@ pub(crate) fn subscribe(
 struct Tracker {
     task_id: String,
     context_id: String,
-    seen_artifacts: HashSet<String>,
+    /// What this subscriber was last sent, by slot (see `artifact_slot`).
+    seen_artifacts: HashMap<String, String>,
     last: StatusKey,
     /// The request activated `steps/v1`: a step goes out with its report, at most one update a
     /// second. Without it a step is a line of text, and every line goes out, as progress always did.
@@ -83,7 +86,7 @@ impl Tracker {
     fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
         let mut events = Vec::new();
         for artifact in &view.artifacts {
-            if self.seen_artifacts.insert(artifact_id(artifact)) {
+            if self.admit(artifact) {
                 events.push(self.artifact_event(artifact));
             }
         }
@@ -108,6 +111,13 @@ impl Tracker {
             }));
         }
         events
+    }
+
+    /// Whether `artifact` is news to this subscriber, and now known to it: its slot last held other
+    /// content (or nothing).
+    fn admit(&mut self, artifact: &adam_runtime::Artifact) -> bool {
+        let (slot, content) = artifact_slot(artifact);
+        self.seen_artifacts.insert(slot, content.clone()) != Some(content)
     }
 
     fn artifact_event(&self, artifact: &adam_runtime::Artifact) -> TaskEvent {
@@ -209,6 +219,7 @@ impl Tracker {
                 vec![working(Message::new(Role::Agent, vec![part]))]
             }
             RunEvent::Artifact {
+                id,
                 name,
                 mime_type,
                 data,
@@ -216,7 +227,8 @@ impl Tracker {
             } => {
                 let mut artifact = adam_runtime::Artifact::new(name, mime_type, data);
                 artifact.file = file;
-                if self.seen_artifacts.insert(artifact_id(&artifact)) {
+                artifact.id = id;
+                if self.admit(&artifact) {
                     vec![self.artifact_event(&artifact)]
                 } else {
                     Vec::new()
@@ -300,7 +312,7 @@ async fn pump(
     let mut tracker = Tracker {
         task_id: task.id.clone(),
         context_id,
-        seen_artifacts: view.artifacts.iter().map(artifact_id).collect(),
+        seen_artifacts: view.artifacts.iter().map(artifact_slot).collect(),
         last: status_key(&task.status),
         steps: caller.has_extension(STEPS_EXTENSION),
         reported: HashMap::new(),
