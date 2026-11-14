@@ -34,7 +34,7 @@ agent's files ([ADR 0028](../../docs/decisions/0028-the-card-says-which-build-an
 
 ## Devcontainers are off here
 
-The coder image carries the devcontainer CLI and Podman's client, and the coder can run a repository's commands, checks and OpenCode in
+The coder image carries the devcontainer CLI and Podman's client, and the coder can run a repository's commands and checks in
 that repository's `devcontainer.json` on a rootless Podman service (`DEVCONTAINER_RUNTIME=podman`, [ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
 **The chart does not turn it on, and sets none of the `DEVCONTAINER_*` variables**: the default, `off`, keeps every command in the coder's own
 pod, as before. Why a pod cannot have it yet:
@@ -95,10 +95,9 @@ this repository.
 | Rendered for | the roles that run workers (`all`, `worker`; the split worker), like `MODEL_API_KEY`. A control plane and the split front render nothing, read no property, and need none: the option does nothing for them |
 | In the pod | `MODEL_BASE_URL` `valueFrom.secretKeyRef` (`<secret>`, key `MODEL_BASE_URL`), once, in place of `value:` |
 | In the `ExternalSecret` | `secretKey: MODEL_BASE_URL`, `remoteRef.property: externalSecrets.properties.modelBaseUrl` under `externalSecrets.key` |
-| Everything else | unchanged: `MODEL`, `OPENCODE_MODEL` and `MODEL_API_KEY` are as before, and the default render is byte for byte `tests/golden/combined.yaml` |
+| Everything else | unchanged: `MODEL` and `MODEL_API_KEY` are as before (`OPENCODE_MODEL` is gone, ADR 0038), and the default render is byte for byte `tests/golden/combined.yaml` |
 
-**What reads the URL.** Only the binary, from the environment variable, at startup (`bin/adam-coder/src/config.rs`). OpenCode's inline
-configuration is built from it at run time (`bin/adam-coder/src/opencode.rs`, `baseURL`), so it needs nothing from the chart. Nothing else in
+**What reads the URL.** Only the binary, from the environment variable, at startup (`bin/adam-coder/src/config.rs`). Nothing else in
 the chart uses the URL: the `NetworkPolicy` leaves egress open, the extra MCP servers' file and the front do not name it. The chart renders
 the literal in no template when the option is on (`tests/render-check.sh` asserts that the placeholder appears nowhere in the render). **No
 Rust change and no new image are needed**: the binary already reads `MODEL_BASE_URL` and does not care where Kubernetes got it, so the chart
@@ -317,7 +316,7 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 "Roles") for what each role starts and needs.
 
 A control plane needs no model, GitHub or workspace configuration, so with
-`config.role=control-plane` the chart leaves out `MODEL_BASE_URL` (the literal, or the Secret key of `config.modelBaseUrlFromSecret`), `MODEL`, `OPENCODE_MODEL`,
+`config.role=control-plane` the chart leaves out `MODEL_BASE_URL` (the literal, or the Secret key of `config.modelBaseUrlFromSecret`), `MODEL`,
 `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
 `PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, `GITHUB_MCP_URL` and the GitHub MCP server sidecar, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
@@ -429,7 +428,7 @@ credentials you are willing to see used that way. Do not also set `config.extraE
 (it would override the cap).
 
 **The tier is not a boundary against a command.** With `runPods.enabled: false` and no Podman devcontainers (the default),
-`run_command`, `run`, `run_checks` and OpenCode run **in the coder's own container**, as the user that holds the GitHub App's
+`run_command`, `run` and `run_checks` run **in the coder's own container**, as the user that holds the GitHub App's
 private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`; the chart always uses the file form). A command can read it, mint an installation token
 and do whatever the App may, at any tier, a `plan` included. **So an App needs run pods: the chart refuses to render
 `github.auth: app` with `runPods.enabled: false`, and the coder refuses to start that way (exit 78)**
@@ -559,7 +558,7 @@ without.
   expanded when a worker starts. The ConfigMap has no secret in it. `valuePrefix` is plain text (`Bearer `): a `${` in it
   fails the render. With `externalSecrets.enabled: false` the render fails too, because a key has nowhere else to come from.
 * **The binary keeps those keys from repository code.** Every `${VAR}` a `mcp.json` names (the agent's own and this file's)
-  is hidden from every process a run starts (a repository's checks, `run_command`, OpenCode), and its value is scrubbed from
+  is hidden from every process a run starts (a repository's checks, `run_command`, `run`), and its value is scrubbed from
   tool output, errors and steps, so the model never sees it (commits are not scrubbed). The coder's own `git` starts from an
   empty environment, and the process is non-dumpable, so a child cannot read `/proc/<pid>/environ`. What remains (the token
   of the one `git` invocation that fetches or pushes, a proxy URL with a password, a process with `CAP_SYS_PTRACE`) is listed
@@ -642,7 +641,7 @@ through (it reaches the pod through the kubelet, not from another namespace); th
 ## Run pods
 
 `runPods.enabled: true` ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) runs the processes of each active
-run, the project's checks, the commands that look around, OpenCode and everything it starts, in **a pod of the run's own**, so that a build is bounded by
+run, the project's checks, the commands that look around and everything they start, in **a pod of the run's own**, so that a build is bounded by
 a pod's memory and not by the coder's. The files, git and every credential stay in the coder pod, which then needs about 1Gi instead of 6Gi.
 **Off by default, and then invisible**: the render is the golden `tests/golden/combined.yaml`, byte for byte (the chart version moved to 0.3.0, the one
 line that differs). Nothing of it is rendered for a control plane (`config.role: control-plane`), which starts no commands.
@@ -654,10 +653,10 @@ What it renders, and why each is there:
 
 | Object | What |
 |---|---|
-| `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
+| `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, no model key and no Secret reference (ADR 0038), the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec`, alone, out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is a projected volume mounted in the coder container alone: the pod automounts none, so neither the git sandbox nor the GitHub MCP sidecar has it; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
-| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references a Secret key other than `MODEL_API_KEY` of the ExternalSecret's Secret (by name **and** key), or any Secret by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
 | `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
 | a `git-sandbox` container in the coder pod, and a projected token volume | **the git sandbox**, where the coder's local git runs because a repository's configuration can name a program: [below](#the-git-sandbox) |
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
@@ -695,12 +694,12 @@ configuration (`git add`, `commit`, `stash`, `reset`, `tag`, `branch`, `config -
 the run adds later (a repository, a scratch project) needs a pod made again: when no command runs in it the coder does it at once, right after it adds the slot, and when one does the tool says so and the next command waits for it to end
 (`RUN_POD_WAIT_SECS`) like it waits for a quota slot. A pod made by an earlier release is made again the same way, and so is the pod of a run whose slot was lost and added again (the mounts follow a directory, and the slot's directory in the mirror is a new one under the same name). Limits (ADR 0041): the mirror of a
 repository is shared by everyone who works on it, so their unpushed `agent/*` branches and worktree directories in it can be read; the [package
-cache](#the-package-cache) is writable by every run; the model key is a variable of the run pod, readable by its commands, as it was in the coder's own.
+cache](#the-package-cache) is writable by every run; a run pod holds no model key and no Secret a container can read (ADR 0038); the pull secrets are the chart's own. `runPods.enabled` no longer needs `externalSecrets.enabled`.
 
 **Checked by:** `tests/render-check.sh` (each object, the pod template, every rule of the policy, the quota's scope, the values and the refusals; the render is
 `tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
-in it, a kill, the idle sweep, the policy refusing sixteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
+in it, a kill, the idle sweep, the policy refusing nineteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
 seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*verified 2026-10-27*: run 40456829784, job 122032008830), and, new with the egress proxy, the network policies: [below](#the-egress-proxy). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
 namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy (kind's, kindnet, does, and the job fails when it does not), and the HTTP status of an admission refusal (the
@@ -757,6 +756,13 @@ flowchart LR
   `runPods.enabled`, the mode where a run's commands leave the coder's container too. `config.extraEnv` may not set `GIT_SANDBOX_SOCKET` while it is on.
 * **Without run pods nothing changes and nothing is protected**: no sandbox container, no `GIT_SANDBOX_SOCKET`, the pod automounts no token (as it did not), and git runs in the coder's
   container next to the secrets, as the run's commands do. Local mode and Podman are the same. A deployment that runs its own sandbox sets `GIT_SANDBOX_SOCKET` in `config.extraEnv` itself.
+* **Upgrading from a chart that gave run pods the model key (ADR 0038): move the pod template and the coder pin together.** The coder now
+  refuses, at startup (exit 78, `<template path>: container run has the variable MODEL_API_KEY from a Secret (secretKeyRef): a run pod
+  holds no Secret (ADR 0038), so a template from an older chart that gives the model key must be replaced`), a template with any `secretKeyRef`,
+  `envFrom` Secret or Secret volume in a container or init container. A template that names no Secret but whose init container still copies
+  `/opt/adam/bin/opencode` (`cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/ ...`) starts, and every run pod then fails in its
+  init container (`cp: cannot stat '/opt/adam/bin/opencode'`, the new image has none): no run starts. An operator that mirrors this chart (the
+  platform's) must render the new template before, or with, the new coder image.
 * **Upgrading** a deployment that has run pods on: the coder rolls once. The GitHub MCP sidecar no longer has the service-account token (it never needed it), and the coder container
   reads its token from the projected volume (`kube-client` 4.2.0 reads `/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}` and re-reads the token file at
   most every 60 s, so the kubelet's rotation reaches it: *verified 2026-10-27* in its source, `config/incluster_config.rs` and `client/auth/mod.rs`; `adam-kube-exec` reads the same files). A `GIT_CONFIG_GLOBAL` file that the deployment names must exist in the sandbox too (the same image).

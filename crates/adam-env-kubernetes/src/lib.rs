@@ -2,7 +2,7 @@
 //!
 //! [`KubeEnvironment`] is an [`Environment`](adam_workspace::Environment) of `adam-workspace`: the coder
 //! asks it for the session of a run, has the session prepare each command (`run_command`, `run_checks`,
-//! OpenCode and every command OpenCode starts), and spawns what comes back. The files and the paths are
+//! and every command they start), and spawns what comes back. The files and the paths are
 //! the same in the pod as in the coder (the pod mounts the run's own directory of the coder's workspace
 //! volume at the same path, and the git directories its worktrees need), so the file tools and all git work
 //! stay in the coder, which is also where the credentials are. **A run pod sees only its own run**
@@ -12,10 +12,10 @@
 //!   pod template ([`PodTemplate`]) and waits for it to be ready, reporting what it waits for as a step.
 //!   The pod is found again by its name, so `ensure` is idempotent and a dropped call leaves nothing a
 //!   later call cannot use.
-//! * **The template is the deployment's.** Image, resources, priority class, security context, volumes,
-//!   variables from Secrets and node affinity are in a file the chart mounts; the code fills in a name,
+//! * **The template is the deployment's.** Image, resources, priority class, security context, volumes
+//!   and node affinity are in a file the chart mounts; the code fills in a name,
 //!   labels and annotations, and narrows the one mount of the workspace volume to the run
-//!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, and the cluster's admission policy
+//!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, a template that names a Secret is refused at startup, and the cluster's admission policy
 //!   (the chart's) refuses a pod that is anything else.
 //! * **Every slot is a mount of its own, and a new slot needs a new pod.** The pod mounts the run's directory
 //!   and, on top of it, each slot (a worktree or a scratch project), so that a slot's directory is a name

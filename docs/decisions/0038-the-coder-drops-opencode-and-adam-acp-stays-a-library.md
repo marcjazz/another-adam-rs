@@ -2,8 +2,7 @@
 
 Status: **Accepted** (2026-10-11), the owner's decision after the OpenCode study ([ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md),
 *Alternatives*): *"Let's remove OpenCode. But keep the ACP, we'll reuse it in the future."* Corrected the same day: *the
-OpenCode CLI stays in the images, and so do Claude Code and Codex.* Nothing of it is built yet: the slices at the end are the
-order of the removal.
+OpenCode CLI stays in the images, and so do Claude Code and Codex.* *Built 2026-11-14* (operator part void: the operator left this repository, [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)): the coder, the environments, the chart and image, the dev stack and these docs, as slices 1, 2, 4 and 5 below, in one pull request. Slice 3 (the operator) is not this repository's.
 Amends [ADR 0007](0007-progress-as-steps-and-streamed-text.md) (decision 7), [ADR 0010](0010-a-run-works-in-its-repositorys-devcontainer.md)
 (decision 6), [ADR 0018](0018-extra-mcp-servers-are-a-file-merged-over-the-agents-own.md) (decision 4),
 [ADR 0019](0019-a-runs-processes-in-a-pod-of-their-own.md) (decision 4, OD-K5), [ADR 0020](0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)
@@ -61,7 +60,7 @@ it.
    * Devcontainers lose the file `/run/adam/secrets/model-key`, and the tools directory keeps only `adam-exec`.
    * Run pods lose `MODEL_API_KEY` and the init container's copy of `opencode`.
    * The run pods' admission policy, which let a run pod read exactly one Secret for that key, then lets it read none.
-   * `runPods.enabled` no longer needs `externalSecrets.enabled` for this reason (`deploy/coder/templates/_validate.tpl:193`).
+   * `runPods.enabled` no longer needs `externalSecrets.enabled` for this reason (the `runPods.enabled needs externalSecrets.enabled` rule of `deploy/coder/templates/_validate.tpl`, removed).
    * `EnvSession::tool_path` and `EnvSession::secret_ref` leave the `adam-workspace` environment port. Their only use was
      OpenCode. This is a breaking change of a trait (Rule 2): the PR and the crate README say so. The three environments and
      the test doubles drop them. An ACP agent run inside an environment again would bring them back by an ADR.

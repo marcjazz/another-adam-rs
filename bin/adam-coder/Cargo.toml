@@ -1,6 +1,6 @@
 [package]
 name = "adam-coder"
-description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, OpenCode over ACP, checks, push, PR)"
+description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, file edits, checks, push, PR)"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -22,7 +22,6 @@ path = "src/main.rs"
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
-adam-acp.workspace = true
 adam-core.workspace = true
 adam-devcontainer.workspace = true
 adam-env-kubernetes.workspace = true
