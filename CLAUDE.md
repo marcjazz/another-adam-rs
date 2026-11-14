@@ -19,13 +19,11 @@ that integrate adam-rs.
 | `README.md`, `docs/` | the human docs: `docs/README.md` (index), `architecture.md`, `guides/`, `reference/`, `roadmap.md` (the library's own; the product roadmap is `ROADMAP.md` in another-agentic-system, https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md), `decisions/NNNN-*.md` (ADRs) |
 | `CONTRIBUTING.md`, `SECURITY.md` | how to contribute (claim an issue, build, test, open a pull request) and how to report a vulnerability privately; the front door for outside contributors |
 | `crates/`, `bin/adam-coder`, `bin/adam-agent` | libraries, one per concern, and the two agents (library and binary each); each has a `README.md` |
-| `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests |
-| `crates/adam-operator-*`, `bin/adam-operator` | the Kubernetes operator of `AgentService` and `AgentConfig` (ADR 0029): its own ports and testkits, separate from the run path |
-| `deploy/operator/`, `deploy/operator-crds/`, `deploy/crds/`, `docker/operator/`, `tools/adam-operator-parity/` | the operator's charts (renders, goldens, kind e2e, examples), the CRD file both read, its image, and the parity goldens rendered from `deploy/coder` |
+| `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests. **`deploy/coder` is read by another repository**: vymalo/another-agentic-platform renders its parity goldens from this chart at a pinned revision (its `tools/adam-parity/regen.sh`), so what the chart renders for a given value is a contract; say so in the pull request when it changes |
 | `dev/`, `compose.yaml` | local stack: databases, WireMock mocks, a git server, example agent folders `dev/agents/*/agent`, e2e scripts `dev/*-e2e.sh` |
 | `tools/docs-check/` | diagram, link, anchor, crate-README and skill checker (also in CI) |
 | `.agents/skills/` | first-party (`adam-*`, `update-vendored-skills`) and vendored skills (`skills-lock.json`); `.claude/skills`, `.goose/skills`, `.kiro/skills` are symlinks |
-| `.github/workflows/` | `ci.yml` (Rust, docs, compose), `coder.yml` (image, chart, e2e, tag bump), `operator.yml` (the operator's charts, kind jobs, image, tag bump), `nightly.yml` (live services) |
+| `.github/workflows/` | `ci.yml` (Rust, docs, compose), `coder.yml` (image, chart, e2e, tag bump), `nightly.yml` (live services) |
 
 ## Rules — check every change against these
 
@@ -62,7 +60,6 @@ architecture with pictures, and deploy instructions. Agent-only context lives he
   | a process, lifecycle, port, role or the store schema | `docs/architecture.md` (diagram and tables) |
   | the agent file format, validation, `#[tool]` | `docs/reference/agent-files.md`, `docs/guides/write-an-agent.md` |
   | the chart or the image | `deploy/coder/README.md`, `docs/guides/deploy-the-coder.md` |
-  | the operator: a CRD type, a crate's API, its chart | the crate README, `deploy/operator/README.md`; regenerate the CRD (`cargo run -q -p adam-operator -- crdgen > deploy/crds/agents.vymalo.com.yaml`, copy it to `deploy/operator-crds/files/`) and, when `deploy/coder` changes what pods run, the parity goldens (`sh tools/adam-operator-parity/regen.sh`) |
   | compose, a mock, a scripted model, an e2e script | `docs/reference/dev-stack.md`, `docs/guides/run-locally.md`, `docs/guides/testing.md` |
   | a path a first-party skill cites | the skill (docs-check fails on a missing path) |
 
@@ -114,7 +111,6 @@ file's *Rules* → first-party skills (`adam-*`) → vendored skills. Start with
 | Implementing or changing a `Store` or `Notifier` | **`adam-store-adapter`** |
 | Touching A2A extensions (the card, activation) | **`adam-a2a-extensions`** |
 | Changing the image or the chart, releasing | **`adam-coder-deploy`** |
-| Running agents on Kubernetes as `AgentService` and `AgentConfig`, the operator's charts and CRDs | **`adam-operator`** |
 | Moving a consumer between adam-rs revisions | **`adam-upgrade`** |
 | Updating the vendored skills | **`update-vendored-skills`** (internal) |
 | A decision, a vague request, a claim to check | `documentation-and-adrs` (format: Rule 8), `idea-refine`, `spec-driven-development`, `planning-and-task-breakdown`, `source-driven-development` |
@@ -127,8 +123,8 @@ file's *Rules* → first-party skills (`adam-*`) → vendored skills. Start with
 Off-domain here: `domain-cli`, `domain-embedded`, `domain-fintech`, `domain-iot`, `domain-ml`. Not for direct
 use: the `core-*` helpers, `meta-cognition-parallel`, `rust-skill-creator`, `rust-daily`, `m14-mental-model`.
 
-**Skills this repo provides.** Other repositories install the seven public ones (`adam-agent-folder`,
-`adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-operator`, `adam-upgrade`) with the CLI:
+**Skills this repo provides.** Other repositories install the six public ones (`adam-agent-folder`,
+`adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`) with the CLI:
 
 ```sh
 npx skills add vymalo/another-adam-rs --list
