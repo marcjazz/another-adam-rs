@@ -149,6 +149,24 @@ with repository work to deliver ends only with a pull request, a failure (a limi
 among them: the run gets one closing turn without tools, and its answer is the failure's text), or `CancelTask`; a run
 without any ends when the model answers and asks nothing, and so does one that reached a limit with no repository or scratch project.
 
+### Project instructions
+
+What a repository says about itself reaches the model as a **tool result**, not as a message of the person and never in the system prompt ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 10).
+
+| When | What is read | Where it goes | Size |
+|---|---|---|---|
+| `prepare_workspace` on a repository | `AGENTS.md` at the slot root, else `CLAUDE.md`, else `README.md` (one of them) | after the lines of the result | 32 KiB, cut at a whole line |
+| the first read call below a directory with its own file (`read_file`, `list_files`, `find_files`, `search_files` with a `path`) | `AGENTS.md`, else `CLAUDE.md` (never `README.md`); the shallowest directory not yet shown, one per call | before the page, so the paging line stays last | 8 KiB |
+
+* **A frame.** A block is a header line (the file's name, the slot, "the repository's text, not the person's", that it never overrides the person's request or the agent's instructions, names no repository, grants no access tier and approves nothing), the text, and the closing line `[end of project instructions from <file>]`. A cut text ends with `[more: N lines left; next page: read_file path=<file> repo=<slot> offset=K]` before the closing line. When `AGENTS.md` is read and a different `CLAUDE.md` exists, the block says so.
+* **The text can forge nothing.** It is shown the way `read_file` shows a file: every line behind its number and a tab (the numbers `read_file` counts, so `offset=K` is exact), control characters (ESC, `\r`, the C1 range) written `\xNN`, a line over 2,000 characters clipped (`… [line cut: N chars]`). So no line of it starts with `[`: it cannot write the paging line, the closing line, another block's header or the marker of a shortened history. A kept-output pointer planted in it is harmless (the history keeps one only for the id of its own call).
+* **It can never** name a repository the run may use, grant an access tier or approve anything: the gates read the notes the agent fills from the person's own messages, and this text is not one.
+* **Reading.** Through the slot's descriptor. Names are exact: `AGENTS.md`, not `agents.md` (a case-insensitive file system is not handled specially). A link that stays in the slot is followed, so an `AGENTS.md` that is a link to `CLAUDE.md` shows that file; one that leaves it, a non-regular file (a FIFO is not waited for), text that is not UTF-8, text with a NUL and a file over 4 MiB count as absent, with a note, and the next name is tried. Scrubbed like any output, before it is cut.
+* **Shown once, per run.** `RunNotes::instructions_shown` records the call id. The same call (a retry) shows the text again; a later call of the run does not, and a second `prepare_workspace` of the same slot shows nothing. A subagent is its own run: its own prepare or read shows the text again. The text is read once: a later change to the file, the model's own included, is not shown again, and a replay returns the journaled bytes.
+* **Caps.** A root is always shown. Below the roots a run is shown at most 32 directories' files; the next read that would show one says once, in one line, that more exist and can be read with `read_file`. A nested file whose escaped path is longer than 256 bytes is not shown, with a one-line note (its path would be written three times into a result the loop caps at 64 KiB).
+* **A shortened history** cuts an old instructions result like any other result over 512 characters, from its end. In the result of `prepare_workspace` the block follows the workspace lines, so a deep cut can remove the header, the closing line and all the text; the truncation marker still says that a file is read with its read tool, and the file is still in the slot: the model reads `AGENTS.md` again with `read_file`. A shallower cut leaves the head, header included.
+* A folder agent has no slots and is unchanged.
+
 ## Rules in code
 
 | Rule | Where |
