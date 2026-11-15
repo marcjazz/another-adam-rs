@@ -21,7 +21,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -108,14 +108,14 @@ the conversation of the run before:
 |---|---|
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
 | **Answered** | the tool calls of a last assistant message that did not all get a result: a run that ended mid-turn (a cancel, a limit, a question nobody answered) leaves them, and a provider rejects a call without a result. Each owed call gets an error result, `STOPPED_BY_THE_PERSON`, after the results that did arrive: the model keeps what it asked for and is told which calls did not finish. The run state cannot tell a cancel from another ending, so a run that failed gets the same text. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before, and never runs a stopped call. The side effects of the calls are not undone |
-| **Reset** | `turns`, `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, `artifacts` (the final output lists what this run produced), `kept_outputs` (the texts a run keeps are the run's own) and `rounds_started` (a task counts its own rounds, ADR 0045); the `session` header of a round is carried |
+| **Reset** | `turns`, `shortenings` (the turns are this run's own), `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, `artifacts` (the final output lists what this run produced), `kept_outputs` (the texts a run keeps are the run's own) and `rounds_started` (a task counts its own rounds, ADR 0045); the `session` header of a round is carried |
 | **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
-| **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation `max_history_tokens` does when a history is sent); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
+| **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation a run does to its own history over `max_history_tokens`, with the same floor and pointer rules); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
 | **The marker** | the **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX` and naming the number of turns; `omitted_turns` (not the text) is what says the part is a marker, so a user message that merely starts with the prefix is an ordinary one. It is always the second part: before anything is dropped, a first message that has several parts (`[task, next]`, from a run that ended before the model answered) is reduced to its task, and the rest becomes a user message of its own (a turn like any other), then merged behind the marker. A rule that reads what the user said should read user messages part by part and skip that part (`Conversation::is_omission_marker`) |
 | **Alternating** | user messages that would be adjacent become one message with several text parts (the marker and what follows it, the new message after a history that ends with the user's, the waiting ones before the new one), because chat templates that insist on alternating roles reject two user messages in a row |
 
 The cap is not "history the model would be cut anyway": `max_history_tokens` (`src/history.rs`) only ever
-shortens tool output in what is sent, so shortening tool output first is the loss the loop already accepts, and
+shortens tool output (in the stored history), so shortening tool output first is the loss the loop already accepts, and
 dropping turns is the last resort. The cap is about what is stored and carried. **An agent that wraps an
 `LlmAgent` and delegates `init` must delegate `init_continuing` too.** Breaking for code that builds a
 `Conversation` with a struct literal (two new public fields) and for `AgentStarter` implementors (`State` now
@@ -766,3 +766,77 @@ as a `ToolOutput::error`; `src/schema.rs` tests the generated schema (run them w
 [`adam-model`](../adam-model/README.md),
 [`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).
+
+## The prefix holds (ADR 0044, slice 4)
+
+Each request of a run starts with the one before it, so a provider's prompt cache keeps hitting. This
+is a rule of the loop, not a guarantee of the whole request: the list of what breaks it is below, whole.
+
+**Shortenings are recorded once, in the state.** At the start of a step, from the state as it was
+committed (before the step reads an inbox message, a deferred one or the answer to a question: those
+count toward the budget one turn later), `record_shortenings` (`src/history.rs`) shortens the history
+when it is over `Limits::max_history_tokens` (characters / 4): the oldest tool outputs outside the
+protected tail (the results after the last assistant message), down to **three quarters of the budget**,
+and the turn (`Conversation::turns`, the turn of the next request) is pushed onto
+`Conversation::shortenings`. The request's messages are the state's messages. It is a function of the
+committed state, so a retry or a replay after a crash shortens the same way, whatever arrived in
+between. **The stored history is no longer the complete history**; the journal still holds each tool's
+original output.
+
+* **The count is cumulative.** An output that was cut and grows again is cut from its head; its single
+  marker says how many characters of the original are gone, in all.
+* **A pointer stays.** A line that says how to read a kept output back (`read_pointer`: a line holding
+  `read_output {"id":"o-…"}`) is put after the marker when a cut removes it, so `read_output` stays
+  reachable whatever the cut.
+* **A small result is never cut.** A tool result under `SHORTENING_FLOOR` (512 characters) is left whole:
+  small structured results hold ids nothing else repeats (a session's, a plan's, a shared file's).
+* **The marker says how to get more:** `[truncated: N chars of tool output omitted to fit the history
+  limit; a kept output is read back with read_output, a file with its read tool]`.
+* **"Rarely" holds while one cut can reach three quarters of the budget:** the next comes after the
+  history has grown by a quarter of it. When everything outside the protected tail is already at its
+  marker and the history is still over the budget (a long user message, a result under the floor, many
+  small ones), a large output is cut each turn as it leaves the tail: a shortening is recorded at every
+  such turn, and the break is near the end of the history, not at its start.
+
+**What breaks the prefix** (every item is a place where `system`, `tools` or an earlier message
+changes; everything else only appends):
+
+| Break | Where |
+|---|---|
+| A recorded shortening | `record_shortenings`, the turns in `Conversation::shortenings` |
+| The closing turn: appended to the request only, never kept, so a run reopened after it does not start with that request | `model_turn` (`CLOSING_TURN`) |
+| A source's tools change: its listing, `refine` (the `show` description once the conversation's catalog is held), `withhold` (the access tier) | `offered`, `refined`, `withheld` in `src/source.rs` |
+| The cap pushes a tool out when a new one sorts before it | `offered` (`MAX_SOURCE_TOOLS`) |
+| What a source adds to the instructions: the agents a person mentioned, the access tier | `instructed` |
+| **Time**: a credential in the run's context that expires changes what sources offer and instruct, so `system` and `tools` can change with time alone | `Conversation::drop_expired_context` |
+| A continued run: its first request does not extend the earlier run's last, although the key is the same | `Conversation::continued` |
+
+Nothing in `system` or `tools` is made of a clock or a counter by the loop; the source listings above
+are the only way they move.
+
+**What only appends, and so keeps the prefix:** a message from the inbox, a deferred message, the
+answer to a question, a re-asked answer (a recorded answer that predates a message the run has since
+read is dropped and the model answers again with the message at the end), a session's report (the
+`wait_<turn>` call is added to the model's own message before that message is ever sent back, and the
+report is its result), and the pages read with `read_output`.
+
+**Fixed order.** The agent's own tools are in registration order. Each source's tools are **sorted by
+name before** the cap and the name clashes are applied (`offered`): the sort decides which tools
+survive `MAX_SOURCE_TOOLS` and which of two same-named tools of one source is offered (the first of
+them in the listing), so neither depends on the order a server lists in (across reconnects, that order
+is *unverified*).
+
+**Cache key.** The loop sets `ModelRequest::prompt_cache_key` on every request of a run that has a
+conversation id: the first 32 hex digits of the SHA-256 of the id, so every run of a conversation has
+the same key. A session round has a conversation id of its own and so a key of its own; a plain child
+run has none. The hash is not salted: whoever can guess a conversation id can confirm it from the key,
+and the key goes only to the model provider, which receives the conversation anyway. Whether it is
+sent is the client's choice (`MODEL_PROMPT_CACHE_KEY`, `adam-service`).
+
+* **Breaking:** `ModelRequest` has a new public field (`prompt_cache_key`) and `Conversation` one
+  (`shortenings`): struct literals need them. Behaviour: the stored history is shortened in place, and
+  a source's tools are offered by name.
+
+Proof: `tests/prefix.rs`, `a_session_report_keeps_the_prefix` and
+`the_start_result_survives_a_history_far_over_budget` in `tests/sessions.rs`, the tests of
+`src/history.rs`.
