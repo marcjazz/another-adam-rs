@@ -13,8 +13,8 @@ use crate::diagnostic::{Diagnostic, Sink};
 use crate::frontmatter::clean_body;
 use crate::load::{self, AgentFile, FileKind, RemoteSpec};
 use crate::manifest::{
-    AgentManifest, InstructionPart, Instructions, Layout, Package, RemoteAgent, Report, Schedule,
-    Skill, SkillLayout, Subagent,
+    AgentManifest, Command, InstructionPart, Instructions, Layout, MAX_COMMANDS, Package,
+    RemoteAgent, Report, Schedule, Skill, SkillLayout, Subagent,
 };
 
 /// Something that can produce a [`Report`]: the agents it holds and every finding about them.
@@ -139,6 +139,9 @@ struct Entry {
     /// Reached through a symbolic link.
     linked: bool,
 }
+
+/// The most bytes a command file may have: the template's cap and room for its frontmatter.
+const COMMAND_FILE_MAX: u64 = 40 * 1024;
 
 struct Loader<'a> {
     root: &'a Path,
@@ -410,13 +413,22 @@ impl Loader<'_> {
             }
             (None, _) => Vec::new(),
         };
+        let commands = match (find("commands", EntryKind::Dir), kind) {
+            (Some(d), FileKind::Root | FileKind::Named) => self.commands(&d)?,
+            (Some(d), FileKind::Sub) => {
+                let rel = self.rel(&d);
+                self.warn(&rel, "ignored: commands belong to the root agent");
+                Vec::new()
+            }
+            (None, _) => Vec::new(),
+        };
 
         for entry in &entries {
             let known = matches!(
                 (entry.name.as_str(), entry.kind),
                 ("instructions.md" | "mcp.json", EntryKind::File)
                     | (
-                        "instructions" | "skills" | "subagents" | "schedules",
+                        "instructions" | "skills" | "subagents" | "schedules" | "commands",
                         EntryKind::Dir
                     )
             );
@@ -442,6 +454,7 @@ impl Loader<'_> {
             subagents,
             mcp,
             schedules,
+            commands,
         }))
     }
 
@@ -624,7 +637,91 @@ impl Loader<'_> {
             subagents: Vec::new(),
             mcp: None,
             schedules: Vec::new(),
+            commands: Vec::new(),
         }))))
+    }
+
+    /// `commands/<name>.md`, flat: a directory inside is not a command and is warned about.
+    fn commands(&mut self, dir: &Path) -> Result<Vec<Command>, Error> {
+        let mut out: Vec<Command> = Vec::new();
+        for entry in self.list(dir)? {
+            if ignored(&entry.name) || is_readme(&entry.name) {
+                continue;
+            }
+            match entry.kind {
+                EntryKind::File if is_markdown(&entry.name) => {
+                    let rel = self.rel(&entry.path);
+                    // `foo.md.md` is the name `foo.md`, which is not a command name.
+                    let name = entry.name.strip_suffix(".md").unwrap_or(&entry.name);
+                    // Look before reading: a FIFO or a device would hang the load, a huge file
+                    // would fill the memory.
+                    match fs::metadata(&entry.path) {
+                        Ok(meta) if !meta.is_file() => {
+                            self.error(&rel, None, "a command is a regular file");
+                            continue;
+                        }
+                        Ok(meta) if meta.len() > COMMAND_FILE_MAX => {
+                            self.error(
+                                &rel,
+                                None,
+                                format!(
+                                    "the file has {} bytes; a command file takes at most \
+                                     {COMMAND_FILE_MAX}",
+                                    meta.len()
+                                ),
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(Error::io(&entry.path, e)),
+                    }
+                    let Some(text) = self.read(&entry.path)? else {
+                        continue;
+                    };
+                    let mut sink = self.sink(&rel);
+                    let Some(command) = load::parse_command(&mut sink, &rel, &text, name) else {
+                        continue;
+                    };
+                    if let Some(first) = out.iter().find(|c| c.name == command.name) {
+                        let first = first.path.display().to_string();
+                        self.error(
+                            &rel,
+                            None,
+                            format!(
+                                "the command `{}` is already defined by `{first}`",
+                                command.name
+                            ),
+                        );
+                        continue;
+                    }
+                    out.push(command);
+                }
+                EntryKind::Dir => {
+                    let rel = self.rel(&entry.path);
+                    self.warn(
+                        &rel,
+                        "ignored: commands are flat files, `commands/<name>.md`",
+                    );
+                }
+                EntryKind::File => {
+                    let rel = self.rel(&entry.path);
+                    self.warn(&rel, "ignored: a command is `commands/<name>.md`");
+                }
+            }
+        }
+        if out.len() > MAX_COMMANDS {
+            let rel = self.rel(dir);
+            self.error(
+                &rel,
+                None,
+                format!(
+                    "{} commands; an agent takes at most {MAX_COMMANDS}",
+                    out.len()
+                ),
+            );
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     fn schedules(&mut self, dir: &Path, owner: &str) -> Result<Vec<Schedule>, Error> {
