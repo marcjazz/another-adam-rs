@@ -106,6 +106,7 @@ fn kernel_has_openat2() -> bool {
 pub struct Meta {
     mode: RawMode,
     size: u64,
+    mtime: i64,
 }
 
 impl Meta {
@@ -113,6 +114,8 @@ impl Meta {
         Self {
             mode: stat.st_mode,
             size: u64::try_from(stat.st_size).unwrap_or(0),
+            #[allow(clippy::useless_conversion)]
+            mtime: i64::from(stat.st_mtime),
         }
     }
 
@@ -138,6 +141,11 @@ impl Meta {
     /// The size in bytes.
     pub fn size(self) -> u64 {
         self.size
+    }
+
+    /// The time of the last modification, in whole seconds since the epoch.
+    pub fn mtime_secs(self) -> i64 {
+        self.mtime
     }
 
     /// The permission bits (`0o7777`).
@@ -384,6 +392,17 @@ impl Dir {
         Ok(())
     }
 
+    /// Make this directory private to its user: mode `0700` (`fchmod` on the descriptor held, so a
+    /// link swapped in meanwhile is not followed).
+    ///
+    /// # Errors
+    ///
+    /// The errors of `fchmod`.
+    pub fn set_private(&self) -> io::Result<()> {
+        rustix::fs::fchmod(&self.fd, Mode::from_raw_mode(0o700))?;
+        Ok(())
+    }
+
     /// Rename `from` to `to`, both in this directory, replacing what is at `to` (a link is replaced,
     /// not followed).
     ///
@@ -402,6 +421,55 @@ impl Dir {
     /// The errors of `unlinkat`.
     pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
         rustix::fs::unlinkat(&self.fd, single(name)?, AtFlags::empty())?;
+        Ok(())
+    }
+
+    /// Remove the empty directory `name` of this one (`unlinkat` with `AT_REMOVEDIR`; a link is not
+    /// a directory and is refused).
+    ///
+    /// # Errors
+    ///
+    /// The errors of `unlinkat`.
+    pub fn rmdir(&self, name: &OsStr) -> io::Result<()> {
+        rustix::fs::unlinkat(&self.fd, single(name)?, AtFlags::REMOVEDIR)?;
+        Ok(())
+    }
+
+    /// Make the directory `name` of this one private to its user (`0700`), without following a link
+    /// (a link is refused, not chmodded). For a caller that must read a directory that something made
+    /// unreadable.
+    ///
+    /// Linux has no `fchmodat` that refuses a link (`AT_SYMLINK_NOFOLLOW` is `EOPNOTSUPP` there) and
+    /// `fchmod` refuses an `O_PATH` descriptor. So the directory is held by such a descriptor, which
+    /// needs no permission on it, and changed through `/proc/self/fd`, which names what the
+    /// descriptor holds whatever is renamed into its place meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// `ENOTDIR` for a file, `ELOOP` for a link, and the errors of `openat` and `chmod` (no `/proc`
+    /// among them).
+    pub fn make_private(&self, name: &OsStr) -> io::Result<()> {
+        let name = single(name)?;
+        let mode = Mode::from_raw_mode(0o700);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd as _;
+            let held = rustix::fs::openat(
+                &self.fd,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| self.classified(name, e.into()))?;
+            if !rustix::fs::fstat(&held).is_ok_and(|stat| {
+                rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+            }) {
+                return Err(Errno::NOTDIR.into());
+            }
+            rustix::fs::chmod(format!("/proc/self/fd/{}", held.as_raw_fd()), mode)?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        rustix::fs::chmodat(&self.fd, name, mode, AtFlags::SYMLINK_NOFOLLOW)?;
         Ok(())
     }
 
@@ -1417,5 +1485,35 @@ mod tests {
             held.lstat(OsStr::new("l2")).unwrap().permissions() & 0o600,
             0o600
         );
+    }
+
+    /// A directory made unreadable is made private through its parent's handle, with no permission
+    /// on the directory itself; a link in its place is refused and what it leads to keeps its mode.
+    /// Root opens anything, so only another user can tell the first half.
+    #[test]
+    fn a_directory_is_made_private_without_following_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = slot();
+        let held = open(&tmp, Backend::Walk);
+        let locked = tmp.path().join("slot/locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        held.make_private(OsStr::new("locked")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&locked).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(held.open_dir(OsStr::new("locked")).is_ok());
+
+        let outside = tmp.path().join("outside");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&outside, tmp.path().join("slot/link")).unwrap();
+        assert!(held.make_private(OsStr::new("link")).is_err());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "the link's target was not touched"
+        );
+        assert!(held.make_private(OsStr::new("a.txt")).is_err(), "a file");
     }
 }

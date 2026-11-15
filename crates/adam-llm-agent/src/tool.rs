@@ -1,5 +1,6 @@
 //! The [`Tool`] trait and the values that flow through it.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::kept::KeptOutput;
 use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
@@ -258,6 +260,15 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Box<Plan>>,
+    /// A long text the tool wants the run to keep **in its own state**, for
+    /// [`read_output`](crate::ReadOutput) to page through ([`keep_long`](crate::keep_long) makes it,
+    /// and only when the agent has no [`KeptStore`](crate::KeptStore)). The loop moves it into
+    /// [`Conversation::kept_outputs`](crate::Conversation::kept_outputs); it is journaled with the
+    /// result, so a replay keeps the same text.
+    ///
+    /// Absent from a journal written before it existed, and not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Box<KeptOutput>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -276,6 +287,7 @@ impl ToolOutput {
             sandbox: SandboxUsage::new(),
             repeat_key: None,
             plan: None,
+            kept: None,
         }
     }
 
@@ -291,6 +303,7 @@ impl ToolOutput {
             sandbox: SandboxUsage::new(),
             repeat_key: None,
             plan: None,
+            kept: None,
         }
     }
 
@@ -519,6 +532,10 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
+    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)).
+    kept_left: usize,
+    /// The outputs the run keeps in its own state ([`kept_text`](Self::kept_text)).
+    kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
@@ -527,7 +544,10 @@ pub struct ToolCtx {
 
 /// A function from a text to the same text with its secrets replaced.
 #[derive(Clone)]
-struct Scrubber(Arc<dyn Fn(&str) -> String + Send + Sync>);
+struct Scrubber(
+    Arc<dyn Fn(&str) -> String + Send + Sync>,
+    Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+);
 
 impl std::fmt::Debug for Scrubber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -571,6 +591,8 @@ impl ToolCtx {
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
+            kept_left: 0,
+            kept: Arc::default(),
         }
     }
 
@@ -580,8 +602,35 @@ impl ToolCtx {
     /// the scrubber recognises, and the half that is left is durable. See [`scrub`](Self::scrub).
     #[must_use]
     pub fn with_scrub(mut self, scrub: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
-        self.scrub = Some(Scrubber(Arc::new(scrub)));
+        self.scrub = Some(Scrubber(Arc::new(scrub), None));
         self
+    }
+
+    /// [`with_scrub`](Self::with_scrub), and a function that says how long the longest value the
+    /// scrubber replaces is, in bytes. A tool that cuts a text it may only half have (the first part
+    /// of a result) keeps back [`scrub_margin`](Self::scrub_margin) bytes of its end: a scrubber
+    /// that holds a value longer than [`SCRUB_OVERLAP`](crate::SCRUB_OVERLAP) must say so here, and
+    /// one that does not is taken to hold none.
+    #[must_use]
+    pub fn with_scrub_longest(
+        mut self,
+        scrub: impl Fn(&str) -> String + Send + Sync + 'static,
+        longest: impl Fn() -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.scrub = Some(Scrubber(Arc::new(scrub), Some(Arc::new(longest))));
+        self
+    }
+
+    /// How many bytes at the open end of a cut text may be the start of a secret:
+    /// [`SCRUB_OVERLAP`](crate::SCRUB_OVERLAP), or the longest value the scrubber says it holds when
+    /// that is more.
+    pub fn scrub_margin(&self) -> usize {
+        let longest = self
+            .scrub
+            .as_ref()
+            .and_then(|s| s.1.as_ref())
+            .map_or(0, |f| f());
+        longest.max(crate::SCRUB_OVERLAP)
     }
 
     /// `text` with its secrets replaced, as the layer around this tool would; `text` itself when
@@ -612,6 +661,27 @@ impl ToolCtx {
     /// there.
     pub fn plan(&self) -> Option<&Plan> {
         self.plan.as_deref()
+    }
+
+    /// Say how many bytes the run may still keep in its own state and what it keeps there:
+    /// [`kept_left`](Self::kept_left) and [`kept_text`](Self::kept_text). The agent loop does it for
+    /// every call.
+    #[must_use]
+    pub fn with_kept(mut self, left: usize, kept: Arc<BTreeMap<String, String>>) -> Self {
+        self.kept_left = left;
+        self.kept = kept;
+        self
+    }
+
+    /// The bytes a tool may still hand back in [`ToolOutput::kept`]: [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES)
+    /// less what the run keeps already (none for a detached context).
+    pub fn kept_left(&self) -> usize {
+        self.kept_left
+    }
+
+    /// The text the run keeps under the output id `id` in its own state.
+    pub fn kept_text(&self, id: &str) -> Option<&str> {
+        self.kept.get(id).map(String::as_str)
     }
 
     /// Say how many bytes of files the run may still share: what [`files_left`](Self::files_left)

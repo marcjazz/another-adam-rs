@@ -32,8 +32,36 @@ const HIDDEN_FROM_CHECKS: &[&str] = &[
 /// grandchild that outlives its parent may hold them open forever.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
 
+/// The most bytes of a command's output that are captured for keeping: the first 16 MiB. The tail
+/// beyond them is still tracked for the view.
+pub const KEPT_OUTPUT_MAX: usize = 16 * 1024 * 1024;
+
+/// What is captured beyond [`KEPT_OUTPUT_MAX`], and kept before the tail the model is shown: the
+/// margin that `adam_llm_agent::scrub_open_end` and `scrub_open_start` cut back at the edge of a
+/// capture, so that no part of a secret that the edge cut is kept. (No secret is longer.)
+pub const SCRUB_OVERLAP: usize = adam_llm_agent::SCRUB_OVERLAP;
+
+/// A command's output that was kept for `read_output`, or that could not be.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptNote {
+    /// The output id (`o-...`).
+    pub id: String,
+    /// Lines kept.
+    pub lines: u64,
+    /// Bytes kept.
+    pub stored: u64,
+    /// The output was longer than the bound, and only its first bytes are kept.
+    pub cut: bool,
+    /// Why it was not kept, when it was not.
+    pub refused: Option<String>,
+    /// Bytes between the head and the tail of what is shown.
+    pub hidden: u64,
+    /// `hidden` is an estimate (the output outgrew what was captured).
+    pub hidden_about: bool,
+}
+
 /// What a command did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ShellOutcome {
     /// Exit code; `None` when killed by a signal (also on timeout).
     pub exit_code: Option<i32>,
@@ -43,6 +71,37 @@ pub struct ShellOutcome {
     pub tail: String,
     /// Older output was dropped to fit the cap.
     pub truncated: bool,
+    /// The first bytes of the output, when it is too long to show whole (set by
+    /// `output::settle`: head and tail are what the model is shown).
+    pub head: String,
+    /// What the command printed in all, in bytes.
+    pub total: u64,
+    /// The first [`KEPT_OUTPUT_MAX`] and [`SCRUB_OVERLAP`] bytes of the output as captured (only for a
+    /// call that settles it); taken by `output::settle`, which scrubs and keeps them.
+    pub captured: Vec<u8>,
+    /// The last bytes of the output, the tail and the margin before it, when the output is longer
+    /// than the tail (and than what was captured, for a call that keeps it): so that scrubbing sees a
+    /// secret at the start of the tail whole.
+    pub tail_raw: Vec<u8>,
+    /// Where the whole output is kept, once it was settled.
+    pub kept: Option<KeptNote>,
+}
+
+impl std::fmt::Debug for ShellOutcome {
+    /// Lengths, never the captured bytes (up to 16 MiB of them).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellOutcome")
+            .field("exit_code", &self.exit_code)
+            .field("timed_out", &self.timed_out)
+            .field("tail_len", &self.tail.len())
+            .field("truncated", &self.truncated)
+            .field("head_len", &self.head.len())
+            .field("total", &self.total)
+            .field("captured_len", &self.captured.len())
+            .field("tail_raw_len", &self.tail_raw.len())
+            .field("kept", &self.kept)
+            .finish()
+    }
 }
 
 impl ShellOutcome {
@@ -116,17 +175,42 @@ struct Tail {
     buf: Vec<u8>,
     cap: usize,
     total: u64,
+    /// The first bytes, up to [`KEPT_OUTPUT_MAX`] and [`SCRUB_OVERLAP`], for keeping; empty (and
+    /// never filled) for a call that does not keep.
+    all: Vec<u8>,
+    capture: bool,
+    /// What is held before the tail, and captured beyond [`KEPT_OUTPUT_MAX`]: at least
+    /// [`SCRUB_OVERLAP`], and the longest value the redactor holds when that is more.
+    margin: usize,
 }
 
 impl Tail {
     fn push(&mut self, chunk: &[u8]) {
         self.total += chunk.len() as u64;
+        if self.capture {
+            let room = (KEPT_OUTPUT_MAX + self.margin).saturating_sub(self.all.len());
+            self.all.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        }
         self.buf.extend_from_slice(chunk);
-        // Compact lazily so a firehose does not copy on every chunk.
-        if self.buf.len() > self.cap * 2 {
-            let drop = self.buf.len() - self.cap;
+        // Compact lazily so a firehose does not copy on every chunk. What is held is the tail and,
+        // when keeping, the overlap before it.
+        let hold = self.hold();
+        if self.buf.len() > hold * 2 {
+            let drop = self.buf.len() - hold;
             self.buf.drain(..drop);
         }
+    }
+
+    /// The tail and the margin before it, for every run: a tail cut at its start may begin in the
+    /// middle of a secret, and whoever scrubs it needs the bytes before it to cut that back.
+    fn hold(&self) -> usize {
+        self.cap + self.margin
+    }
+
+    /// The last `cap + margin` bytes (what scrubbing needs).
+    fn raw(&self) -> Vec<u8> {
+        let start = self.buf.len().saturating_sub(self.hold());
+        self.buf[start..].to_vec()
     }
 
     fn finish(&self) -> (String, bool) {
@@ -338,20 +422,48 @@ pub async fn run_in(
     tail_cap: usize,
     cancel: &CancelToken,
 ) -> Result<ShellOutcome, RunError> {
-    run_timed(session, spec, timeout, tail_cap, cancel).await.0
+    run_timed(session, spec, timeout, tail_cap, SCRUB_OVERLAP, cancel)
+        .await
+        .0
 }
 
 /// [`run_in`], and how long the process ran: from the moment it was spawned to its exit, or, for a
 /// command stopped by a timeout or a cancel, until it was stopped. `None` when no process ran (the
 /// environment refused the spec, the process could not be started, the run was cancelled first).
 /// A pod's commands are metered by it (ADR 0043).
-#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
 pub async fn run_timed(
     session: &dyn EnvSession,
     spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
+    margin: usize,
     cancel: &CancelToken,
+) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
+    run_with(session, spec, timeout, tail_cap, margin, cancel, false).await
+}
+
+/// [`run_timed`] that also captures the output for keeping ([`ShellOutcome::captured`]): for a tool
+/// that settles it (`output::settle`).
+pub async fn run_captured(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
+    timeout: Duration,
+    tail_cap: usize,
+    margin: usize,
+    cancel: &CancelToken,
+) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
+    run_with(session, spec, timeout, tail_cap, margin, cancel, true).await
+}
+
+#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
+async fn run_with(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
+    timeout: Duration,
+    tail_cap: usize,
+    margin: usize,
+    cancel: &CancelToken,
+    capture: bool,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
     if cancel.is_cancelled() {
         return (Err(RunError::Cancelled), None);
@@ -378,6 +490,9 @@ pub async fn run_timed(
         buf: Vec::new(),
         cap: tail_cap.max(1),
         total: 0,
+        all: Vec::new(),
+        capture,
+        margin: margin.max(SCRUB_OVERLAP),
     }));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -426,13 +541,33 @@ pub async fn run_timed(
         }
     }
 
-    let (tail, truncated) = tail.lock().unwrap_or_else(PoisonError::into_inner).finish();
+    let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    let (text, truncated) = tail.finish();
+    // Output that fits the tail is shown whole and not kept: nothing is held twice.
+    // A tail that is only the end of the output starts anywhere: its raw bytes, with the margin before
+    // them, go to whoever scrubs it (`output::settle`, or `ToolEnv::run` for a call that keeps
+    // nothing).
+    let (captured, tail_raw) = if truncated && capture {
+        let whole = tail.total <= tail.all.len() as u64;
+        let raw = if whole { Vec::new() } else { tail.raw() };
+        (std::mem::take(&mut tail.all), raw)
+    } else if truncated {
+        (Vec::new(), tail.raw())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let total = tail.total;
+    drop(tail);
     (
         Ok(ShellOutcome {
             exit_code,
             timed_out,
-            tail,
+            tail: text,
             truncated,
+            total,
+            captured,
+            tail_raw,
+            ..ShellOutcome::default()
         }),
         Some(ran),
     )
@@ -558,6 +693,31 @@ mod tests {
         assert!(out.tail.len() <= 200, "{}", out.tail.len());
         assert!(out.tail.contains("line-1999"), "{:?}", out.tail);
         assert!(!out.tail.contains("line-0\n"), "{:?}", out.tail);
+    }
+
+    /// What is captured for keeping is the whole output (first bytes) when it is long, with its
+    /// size; short output is only in the tail, and nothing is held twice.
+    #[tokio::test]
+    async fn long_output_is_captured_whole_for_keeping_and_short_output_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = run_captured(
+            &LocalSession,
+            shell_spec(dir.path(), "seq 1 20000"),
+            LONG,
+            1024,
+            SCRUB_OVERLAP,
+            &CancelToken::new(),
+        )
+        .await
+        .0
+        .unwrap();
+        assert!(long.truncated);
+        let expected: String = (1..=20000).map(|i| format!("{i}\n")).collect();
+        assert_eq!(long.total, expected.len() as u64);
+        assert_eq!(String::from_utf8(long.captured.clone()).unwrap(), expected);
+        assert!(long.tail.ends_with("20000\n"));
+        let short = run_shell(dir.path(), "seq 1 5", LONG, 1024).await.unwrap();
+        assert!(!short.truncated && short.captured.is_empty() && short.total == 10);
     }
 
     #[tokio::test]
@@ -780,6 +940,7 @@ mod tests {
             timed_out: false,
             tail: tail.to_owned(),
             truncated: false,
+            ..ShellOutcome::default()
         }
     }
 

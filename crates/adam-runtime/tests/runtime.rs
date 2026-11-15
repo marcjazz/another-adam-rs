@@ -4982,8 +4982,9 @@ mod cases {
 
         // Two hours of waiting for the answer.
         for _ in 0..2 {
-            clock.advance(Duration::from_secs(60 * 60));
+            // The version is read before the clock moves, so the look it causes is the one waited for.
             let seen = rt.view(child).await.unwrap().unwrap().version;
+            clock.advance(Duration::from_secs(60 * 60));
             wait_for(&rt, child, "looked at", |v| v.version > seen).await;
         }
         assert_eq!(
@@ -5058,11 +5059,22 @@ mod cases {
 
         // Five seconds before the deadline a wake is due that the deadline did not set.
         clock.advance(Duration::from_secs(1795));
-        let rec = store.load_run(child).await.unwrap().unwrap();
-        let version = rec.version;
-        let mut update = adam_core::RunUpdate::new(RunStatus::Parked, rec.state.clone());
-        update.wake_at = Some(clock.now());
-        store.commit_run(child, rec.version, update).await.unwrap();
+        // The worker may look at the parked child at the same moment (the clock just moved): the
+        // write is tried again on the version it left, and the count starts from that version.
+        let version = loop {
+            let rec = store.load_run(child).await.unwrap().unwrap();
+            if rec.status != RunStatus::Parked {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            let mut update = adam_core::RunUpdate::new(RunStatus::Parked, rec.state.clone());
+            update.wake_at = Some(clock.now());
+            match store.commit_run(child, rec.version, update).await {
+                Ok(_) => break rec.version,
+                Err(adam_core::StoreError::Conflict { .. }) => {}
+                Err(err) => panic!("the wake was not written: {err}"),
+            }
+        };
         let parked = wait_for(&rt, child, "parked again", |v| v.version >= version + 2).await;
         assert_eq!(parked.status, RunStatus::Parked);
         let rec = store.load_run(child).await.unwrap().unwrap();
