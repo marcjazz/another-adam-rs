@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use adam_agent_fixture::AGENT;
 use adam_agent_fs::{Dir, ManifestSource, Strictness};
-use adam_assembly::{AgentDef, Assembly, Error, LOAD_SKILL, READ_SKILL_FILE, SkillField};
-use adam_llm_agent::{Conversation, ToolSet, user_message};
+use adam_assembly::{
+    AgentDef, Assembly, Error, LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillField,
+    run_skills_conformance,
+};
+use adam_llm_agent::{Conversation, ToolCtx, ToolError, ToolOutput, ToolSet, user_message};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use common::{instructions, runtime, spawn_worker, tools, wait_done, write};
 use serde_json::{Value, json};
@@ -477,19 +480,19 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
         ]
     );
 
-    // The schemas: an enum of what each tool takes.
+    // The schemas: a string name, and a window; no enum of what exists.
     let load = tool(&requests[0], LOAD_SKILL);
-    assert_eq!(
-        load.parameters["properties"]["name"]["enum"],
-        json!(["alpha", "beta", "gamma"])
-    );
+    assert_eq!(load.parameters["properties"]["name"]["type"], "string");
+    assert!(load.parameters["properties"]["name"]["enum"].is_null());
     assert_eq!(load.parameters["required"], json!(["name"]));
     let read = tool(&requests[0], READ_SKILL_FILE);
-    assert_eq!(
-        read.parameters["properties"]["skill"]["enum"],
-        json!(["alpha"])
-    );
+    assert_eq!(read.parameters["properties"]["skill"]["type"], "string");
+    assert!(read.parameters["properties"]["skill"]["enum"].is_null());
     assert_eq!(read.parameters["required"], json!(["skill", "path"]));
+    for spec in [load, read] {
+        assert_eq!(spec.parameters["properties"]["offset"]["type"], "integer");
+        assert_eq!(spec.parameters["properties"]["limit"]["type"], "integer");
+    }
 
     // Tier 2: the body, without its frontmatter, and the list of the files.
     let (loaded, is_error) = result(&requests[1], "c1");
@@ -500,12 +503,12 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
          Step 1 of alpha.\nSee [the guide](references/guide.md).\n\n\
          Relative paths in this skill are relative to the skill's directory.\n\
          <skill_resources>\n  <file>assets/logo.bin</file>\n  <file>references/guide.md</file>\n  \
-         <file>scripts/run.sh</file>\n</skill_resources>\n</skill_content>"
+         <file>scripts/run.sh</file>\n</skill_resources>\n</skill_content>\n[end: 11 lines]"
     );
     // Tier 3: the file.
     let (file, is_error) = result(&requests[2], "c2");
     assert!(!is_error);
-    assert_eq!(file, "# Guide\nUse the guide.\n");
+    assert_eq!(file, "# Guide\nUse the guide.\n[end: 2 lines]");
 
     // Both results are in the conversation the run keeps.
     let conversation: Conversation = serde_json::from_value(view.state).unwrap();
@@ -589,7 +592,7 @@ async fn the_refusals_tell_the_model_what_to_do() {
     // A leading `./` is only a spelling.
     assert_eq!(
         result(&request, "dot"),
-        ("# Guide\nUse the guide.\n".to_owned(), false)
+        ("# Guide\nUse the guide.\n[end: 2 lines]".to_owned(), false)
     );
 }
 
@@ -635,10 +638,6 @@ async fn a_preloaded_skill_is_in_the_prompt_and_out_of_the_catalog() {
 
     run(&assembly, "coder").await;
     let requests = model.requests();
-    assert_eq!(
-        tool(&requests[0], LOAD_SKILL).parameters["properties"]["name"]["enum"],
-        json!(["beta", "gamma"])
-    );
     // Its files stay readable; loading it again says there is nothing to load.
     let last = &requests[1];
     assert_eq!(
@@ -648,7 +647,10 @@ async fn a_preloaded_skill_is_in_the_prompt_and_out_of_the_catalog() {
             true
         )
     );
-    assert_eq!(result(last, "file"), ("echo alpha\n".to_owned(), false));
+    assert_eq!(
+        result(last, "file"),
+        ("echo alpha\n[end: 1 lines]".to_owned(), false)
+    );
     assert!(
         result(last, "beta")
             .0
@@ -748,12 +750,14 @@ async fn a_subagent_has_its_own_skills() {
 
     run(&assembly, "coder/helper").await;
     let requests = model.requests();
-    assert_eq!(
-        tool(&requests[0], LOAD_SKILL).parameters["properties"]["name"]["enum"],
-        json!(["delta"])
-    );
     let last = &requests[1];
-    assert_eq!(result(last, "own"), ("delta notes".to_owned(), false));
+    assert_eq!(
+        result(last, "own"),
+        (
+            "delta notes\n[end: 1 lines; no newline at the end of the file]".to_owned(),
+            false
+        )
+    );
     assert_eq!(
         result(last, "parents"),
         (
@@ -846,12 +850,12 @@ async fn embedded_and_directory_manifests_behave_the_same() {
         body.0
             .contains("<file>references/style.md</file>\n  <file>scripts/run.sh</file>")
     );
-    assert_eq!(style, &("# Style\n".to_owned(), false));
-    assert_eq!(script, &("echo run\n".to_owned(), false));
+    assert_eq!(style, &("# Style\n[end: 1 lines]".to_owned(), false));
+    assert_eq!(script, &("echo run\n[end: 1 lines]".to_owned(), false));
     assert_eq!(
         flat,
         &(
-            "<skill_content name=\"triage\">\nRead the issue, then pick a queue.\n</skill_content>"
+            "<skill_content name=\"triage\">\nRead the issue, then pick a queue.\n</skill_content>\n[end: 3 lines]"
                 .to_owned(),
             false
         )
@@ -865,4 +869,535 @@ async fn embedded_and_directory_manifests_behave_the_same() {
         up.1 && up.0.contains("leaves the skill's directory"),
         "{up:?}"
     );
+}
+
+// --- string names, paging, the prefix ------------------------------------------------------------
+
+/// The system, the tools and the tool choice of a request, as a provider is sent them.
+fn head(request: &ModelRequest) -> String {
+    serde_json::to_string(&(&request.system, &request.tools, &request.tool_choice)).unwrap()
+}
+
+/// The messages as the JSON array a provider is sent, without its closing bracket.
+fn open_messages(request: &ModelRequest) -> String {
+    let mut json = serde_json::to_string(&request.messages).unwrap();
+    assert_eq!(json.pop(), Some(']'));
+    json
+}
+
+/// A directory with one agent whose skill `long` has `rows` lines of body and a file of as many.
+fn long_tree(frontmatter: &str, rows: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=rows).map(|n| format!("row {n}\n")).collect();
+    write(
+        dir.path(),
+        &[
+            (
+                "agent/instructions.md",
+                &instructions(&format!("name: coder\n{frontmatter}"), "You are the coder."),
+            ),
+            (
+                "agent/skills/long/SKILL.md",
+                &format!("---\nname: long\ndescription: A long one.\n---\n{body}"),
+            ),
+            ("agent/skills/long/references/big.txt", &body),
+        ],
+    );
+    dir
+}
+
+/// Run the `coder` of `dir` with `model` and return what the model was asked.
+async fn requests_of(dir: &tempfile::TempDir, model: Arc<MockModel>) -> Vec<ModelRequest> {
+    let assembly = assemble(def_of(dir), model.clone());
+    run(&assembly, "coder").await;
+    model.requests()
+}
+
+#[tokio::test]
+async fn the_load_skill_spec_is_the_same_whatever_skills_exist() {
+    let mut specs = Vec::new();
+    for dir in [
+        tree("skills: all"),
+        tree("skills: [alpha]"),
+        long_tree("", 3),
+    ] {
+        let model = Arc::new(MockModel::new());
+        model.push_text("Done.");
+        let requests = requests_of(&dir, model).await;
+        specs.push((
+            serde_json::to_string(tool(&requests[0], LOAD_SKILL)).unwrap(),
+            serde_json::to_string(tool(&requests[0], READ_SKILL_FILE)).unwrap(),
+        ));
+    }
+    assert_eq!(specs[0], specs[1]);
+    assert_eq!(specs[0], specs[2]);
+}
+
+#[tokio::test]
+async fn a_folder_without_skills_lists_every_skill() {
+    let dir = tree("");
+    let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
+    let coder = info(&assembly, "coder");
+    assert_eq!(coder.skills, ["alpha", "beta", "gamma"]);
+    assert!(coder.tools.iter().any(|t| t == LOAD_SKILL));
+    for name in ["alpha", "beta", "gamma"] {
+        assert!(coder.prompt.contains(&format!("<name>{name}</name>")));
+    }
+    // `skills: []` is the way to have none.
+    let dir = tree("skills: []");
+    let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
+    let coder = info(&assembly, "coder");
+    assert!(coder.skills.is_empty());
+    assert!(!coder.tools.iter().any(|t| t == LOAD_SKILL));
+    assert!(!coder.prompt.contains("available_skills"));
+}
+
+#[tokio::test]
+async fn a_long_body_is_paged_with_the_next_offset() {
+    let dir = long_tree("skills: all", 3000);
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![
+        call("first", LOAD_SKILL, json!({"name": "long"})),
+        call(
+            "second",
+            LOAD_SKILL,
+            json!({"name": "long", "offset": 2001}),
+        ),
+        call("zero", LOAD_SKILL, json!({"name": "long", "offset": 0})),
+        call("empty", LOAD_SKILL, json!({"name": "long", "limit": 0})),
+        call("past", LOAD_SKILL, json!({"name": "long", "offset": 9999})),
+        call(
+            "small",
+            LOAD_SKILL,
+            json!({"name": "long", "offset": 2, "limit": 2}),
+        ),
+    ]);
+    model.push_text("Done.");
+    let requests = requests_of(&dir, model).await;
+    let last = requests.last().unwrap();
+
+    // 1 line of tag, 3000 of body, a blank one, the sentence, 3 of resources and the closing tag.
+    let (first, is_error) = result(last, "first");
+    assert!(!is_error);
+    assert!(first.starts_with("<skill_content name=\"long\">\nrow 1\nrow 2\n"));
+    assert!(
+        first.ends_with(
+            "Files this skill bundles (read one with read_skill_file): references/big.txt\n\
+             [more: 1007 lines left; next page: offset=2001]"
+        ),
+        "{}",
+        &first[first.len() - 200..]
+    );
+    let (second, is_error) = result(last, "second");
+    assert!(!is_error);
+    assert!(second.starts_with("row 2000\n"), "{}", &second[..40]);
+    assert!(
+        second.ends_with("</skill_resources>\n</skill_content>\n[end: 3007 lines]"),
+        "{}",
+        &second[second.len() - 120..]
+    );
+    assert!(!second.contains("Files this skill bundles"));
+
+    let (small, _) = result(last, "small");
+    assert_eq!(
+        small,
+        "row 1\nrow 2\n[more: 3004 lines left; next page: offset=4]"
+    );
+    for (id, says) in [
+        ("zero", "offset counts from 1"),
+        ("empty", "limit must be at least 1"),
+        ("past", "`long` has 3007 lines: offset 9999 is past the end"),
+    ] {
+        let (text, is_error) = result(last, id);
+        assert!(is_error && text.contains(says), "{id}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn read_skill_file_pages() {
+    let dir = long_tree("skills: all", 3000);
+    let model = Arc::new(MockModel::new());
+    let read = |id: &str, window: Value| {
+        let mut args = json!({"skill": "long", "path": "references/big.txt"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(window.as_object().unwrap().clone());
+        call(id, READ_SKILL_FILE, args)
+    };
+    model.push_tool_calls(vec![
+        read("head", json!({"limit": 2})),
+        read("tail", json!({"offset": 2999, "limit": 10})),
+        read("back", json!({"offset": -1})),
+        read("past", json!({"offset": 3001})),
+        read("zero", json!({"offset": 0})),
+    ]);
+    model.push_text("Done.");
+    let requests = requests_of(&dir, model).await;
+    let last = requests.last().unwrap();
+    assert_eq!(
+        result(last, "head"),
+        (
+            "row 1\nrow 2\n[more: 2998 lines left; next page: offset=3]".to_owned(),
+            false
+        )
+    );
+    assert_eq!(
+        result(last, "tail"),
+        ("row 2999\nrow 3000\n[end: 3000 lines]".to_owned(), false)
+    );
+    assert_eq!(
+        result(last, "back"),
+        ("row 3000\n[end: 3000 lines]".to_owned(), false)
+    );
+    let (past, is_error) = result(last, "past");
+    assert!(is_error && past.contains("is past the end"), "{past}");
+    assert!(result(last, "zero").1);
+}
+
+#[tokio::test]
+async fn the_request_prefix_holds_across_load_skill() {
+    let dir = tree("skills: all");
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![call("c1", LOAD_SKILL, json!({"name": "alpha"}))]);
+    model.push_tool_calls(vec![call(
+        "c2",
+        READ_SKILL_FILE,
+        json!({"skill": "alpha", "path": "references/guide.md"}),
+    )]);
+    model.push_tool_calls(vec![call("c3", LOAD_SKILL, json!({"name": "nope"}))]);
+    model.push_text("Done.");
+    let requests = requests_of(&dir, model).await;
+    assert_eq!(requests.len(), 4);
+    for pair in requests.windows(2) {
+        assert_eq!(
+            head(&pair[0]),
+            head(&pair[1]),
+            "system and tools are the same bytes"
+        );
+        assert!(
+            open_messages(&pair[1]).starts_with(&open_messages(&pair[0])),
+            "the messages extend the ones before"
+        );
+    }
+}
+
+// --- RunSkills: the skills a run finds ------------------------------------------------------------
+
+/// What a run found: one skill, `src/demo`, with one file, `notes.txt`. It keeps the calls it got.
+#[derive(Default)]
+struct Found {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl Found {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RunSkills for Found {
+    async fn load(
+        &self,
+        _ctx: &ToolCtx,
+        name: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("load {name} {offset} {limit}"));
+        Ok(match name {
+            "src/demo" if offset == 1 => ToolOutput::text("Found demo.\n[end: 1 lines]"),
+            "src/demo" => ToolOutput::error("`src/demo` has 1 lines: offset is past the end"),
+            other => ToolOutput::error(format!("no skill `{other}` was listed")),
+        })
+    }
+
+    async fn read(
+        &self,
+        _ctx: &ToolCtx,
+        name: &str,
+        path: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("read {name} {path} {offset} {limit}"));
+        Ok(match (name, path) {
+            ("src/demo", "notes.txt") if offset == 1 => {
+                ToolOutput::text("Found notes.\n[end: 1 lines]")
+            }
+            _ => ToolOutput::error(format!("no file `{path}` in `{name}`")),
+        })
+    }
+}
+
+fn found_def(dir: &tempfile::TempDir, found: &Arc<Found>) -> AgentDef {
+    def_of(dir).run_skills(found.clone())
+}
+
+#[test]
+fn a_run_skills_implementation_passes_the_conformance_function() {
+    let ctx = ToolCtx::detached("load_skill", "c1", Arc::new(adam_runtime::NoopSink));
+    futures::executor::block_on(run_skills_conformance(&Found::default(), &ctx, "src/demo"));
+}
+
+#[tokio::test]
+async fn with_run_skills_the_root_has_both_tools_without_folder_skills() {
+    // No skills of its own, and `skills:` not set: nothing to load and nothing to read.
+    let dir = long_tree("", 3);
+    std::fs::remove_dir_all(dir.path().join("agent/skills")).unwrap();
+    let plain = assemble(def_of(&dir), Arc::new(MockModel::new()));
+    assert!(!info(&plain, "coder").tools.iter().any(|t| t == LOAD_SKILL));
+
+    let found = Arc::new(Found::default());
+    let model = Arc::new(MockModel::new());
+    model.push_text("Done.");
+    let assembly = assemble(found_def(&dir, &found), model.clone());
+    let coder = info(&assembly, "coder");
+    assert_eq!(coder.tools, [LOAD_SKILL, READ_SKILL_FILE]);
+    assert!(coder.skills.is_empty());
+    // One fixed sentence, and no catalog.
+    assert_eq!(
+        coder.prompt,
+        "You are the coder.\n\nOther skills may be listed to you during the run, named \
+         `<source>/<skill>`; load them with load_skill the same way."
+    );
+    run(&assembly, "coder").await;
+    assert_eq!(
+        tool_names(&model.requests()[0]),
+        [LOAD_SKILL, READ_SKILL_FILE]
+    );
+
+    // With skills of its own the sentence follows the catalog, and the tools are the same two.
+    let dir = tree("skills: [beta]");
+    let assembly = assemble(found_def(&dir, &found), Arc::new(MockModel::new()));
+    let coder = info(&assembly, "coder");
+    assert_eq!(coder.tools[..2], [LOAD_SKILL, READ_SKILL_FILE]);
+    assert!(
+        coder.prompt.ends_with(
+            "</available_skills>\n\nOther skills may be listed to you during the run, named \
+             `<source>/<skill>`; load them with load_skill the same way."
+        ),
+        "{}",
+        coder.prompt
+    );
+    // Even a skill with no file brings the reader: the list of tools never depends on a run.
+    assert_eq!(coder.skills, ["beta"]);
+}
+
+#[tokio::test]
+async fn a_qualified_name_goes_to_run_skills_and_a_plain_one_never_does() {
+    let dir = tree("skills: all");
+    let found = Arc::new(Found::default());
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![
+        call("found", LOAD_SKILL, json!({"name": "src/demo"})),
+        call(
+            "paged",
+            LOAD_SKILL,
+            json!({"name": "src/demo", "offset": 5, "limit": 7}),
+        ),
+        call("folder", LOAD_SKILL, json!({"name": "beta"})),
+        call("plain", LOAD_SKILL, json!({"name": "demo"})),
+        call(
+            "bad-window",
+            LOAD_SKILL,
+            json!({"name": "src/demo", "offset": 0}),
+        ),
+        call(
+            "file",
+            READ_SKILL_FILE,
+            json!({"skill": "src/demo", "path": "notes.txt"}),
+        ),
+        call(
+            "folder-file",
+            READ_SKILL_FILE,
+            json!({"skill": "alpha", "path": "scripts/run.sh"}),
+        ),
+        call(
+            "plain-file",
+            READ_SKILL_FILE,
+            json!({"skill": "demo", "path": "notes.txt"}),
+        ),
+    ]);
+    model.push_text("Done.");
+    let assembly = assemble(found_def(&dir, &found), model.clone());
+    run(&assembly, "coder").await;
+    let last = model.last_request().unwrap();
+
+    assert_eq!(
+        result(&last, "found"),
+        ("Found demo.\n[end: 1 lines]".to_owned(), false)
+    );
+    assert!(result(&last, "paged").1);
+    assert!(
+        result(&last, "folder")
+            .0
+            .starts_with("<skill_content name=\"beta\">")
+    );
+    // A name without `/` is the folder's: an unknown one is answered by the folder's own list.
+    let (plain, is_error) = result(&last, "plain");
+    assert!(
+        is_error && plain.starts_with("no skill `demo` is available to you"),
+        "{plain}"
+    );
+    // The assembly checks the window before the implementation sees it.
+    let (bad, is_error) = result(&last, "bad-window");
+    assert!(is_error && bad.contains("offset counts from 1"), "{bad}");
+    assert_eq!(
+        result(&last, "file"),
+        ("Found notes.\n[end: 1 lines]".to_owned(), false)
+    );
+    assert_eq!(result(&last, "folder-file").0, "echo alpha\n[end: 1 lines]");
+    assert!(result(&last, "plain-file").1);
+    // Only the two qualified loads and the one qualified read reached it.
+    assert_eq!(
+        found.calls(),
+        [
+            "load src/demo 1 2000",
+            "load src/demo 5 7",
+            "read src/demo notes.txt 1 2000"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_subagent_gets_no_run_skills() {
+    let dir = tree("skills: all");
+    let found = Arc::new(Found::default());
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![
+        call("qualified", LOAD_SKILL, json!({"name": "src/demo"})),
+        call(
+            "file",
+            READ_SKILL_FILE,
+            json!({"skill": "src/demo", "path": "notes.txt"}),
+        ),
+    ]);
+    model.push_text("Done.");
+    let assembly = assemble(found_def(&dir, &found), model.clone());
+    // The helper's skills are its own, and the sentence is the root's.
+    let helper = info(&assembly, "coder/helper");
+    assert_eq!(helper.skills, ["delta"]);
+    assert!(!helper.prompt.contains("Other skills may be listed"));
+    assert!(
+        info(&assembly, "coder")
+            .prompt
+            .contains("Other skills may be listed")
+    );
+    run(&assembly, "coder/helper").await;
+    let last = model.last_request().unwrap();
+    let (text, is_error) = result(&last, "qualified");
+    assert!(
+        is_error && text.starts_with("no skill `src/demo` is available to you"),
+        "{text}"
+    );
+    assert!(result(&last, "file").1);
+    assert!(found.calls().is_empty(), "{:?}", found.calls());
+
+    // A helper with no skills at all gets neither tool.
+    let dir = tree("skills: all");
+    std::fs::remove_dir_all(dir.path().join("agent/subagents/helper/skills")).unwrap();
+    let assembly = assemble(found_def(&dir, &found), Arc::new(MockModel::new()));
+    assert!(
+        !info(&assembly, "coder/helper")
+            .tools
+            .iter()
+            .any(|t| t == LOAD_SKILL)
+    );
+}
+
+#[tokio::test]
+async fn skills_empty_turns_run_skills_off() {
+    let dir = tree("skills: []");
+    let found = Arc::new(Found::default());
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![call("c", LOAD_SKILL, json!({"name": "src/demo"}))]);
+    model.push_text("Done.");
+    let assembly = assemble(found_def(&dir, &found), model.clone());
+    let coder = info(&assembly, "coder");
+    assert!(coder.skills.is_empty());
+    assert!(
+        !coder
+            .tools
+            .iter()
+            .any(|t| t == LOAD_SKILL || t == READ_SKILL_FILE)
+    );
+    assert_eq!(coder.prompt, "You are the coder.");
+    run(&assembly, "coder").await;
+    // The model made up a call: it is an unknown tool, and `RunSkills` was not asked.
+    assert!(result(&model.last_request().unwrap(), "c").1);
+    assert!(found.calls().is_empty());
+}
+
+#[tokio::test]
+async fn the_request_prefix_holds_across_a_run_skill() {
+    let dir = tree("skills: all");
+    let found = Arc::new(Found::default());
+    let model = Arc::new(MockModel::new());
+    model.push_tool_calls(vec![call("c1", LOAD_SKILL, json!({"name": "src/demo"}))]);
+    model.push_tool_calls(vec![call(
+        "c2",
+        READ_SKILL_FILE,
+        json!({"skill": "src/demo", "path": "notes.txt"}),
+    )]);
+    model.push_tool_calls(vec![call("c3", LOAD_SKILL, json!({"name": "src/unknown"}))]);
+    model.push_text("Done.");
+    let assembly = assemble(found_def(&dir, &found), model.clone());
+    run(&assembly, "coder").await;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 4);
+    for pair in requests.windows(2) {
+        assert_eq!(
+            head(&pair[0]),
+            head(&pair[1]),
+            "system and tools are the same bytes"
+        );
+        assert!(open_messages(&pair[1]).starts_with(&open_messages(&pair[0])));
+    }
+    // What was found is a tool result, in the messages.
+    assert_eq!(result(&requests[3], "c1").0, "Found demo.\n[end: 1 lines]");
+}
+
+/// A refusal that is an error and not a result would fail the step of the run.
+struct Failing(Found);
+
+#[async_trait::async_trait]
+impl RunSkills for Failing {
+    async fn load(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError> {
+        if name == "src/demo" {
+            self.0.load(ctx, name, offset, limit).await
+        } else {
+            Err(ToolError::Permanent(format!("no skill `{name}`")))
+        }
+    }
+
+    async fn read(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        path: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError> {
+        self.0.read(ctx, name, path, offset, limit).await
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "is a result, not an error")]
+async fn a_refusal_that_is_an_error_fails_the_conformance_function() {
+    let ctx = ToolCtx::detached("load_skill", "c1", Arc::new(adam_runtime::NoopSink));
+    run_skills_conformance(&Failing(Found::default()), &ctx, "src/demo").await;
 }

@@ -54,10 +54,22 @@ const SCRATCH_CYCLES: u32 = 5;
 /// owner may create repositories (the folded `vars.repository_creation` of `agent/instructions.md`).
 const CREATION_ON: &str = "If the person has no repository for it and says you may make one (\"create a repository for it\"), use `create_repository` for an owner they name (it needs the `auto` tier): it asks them, unless they chose `bypass`, and only a yes creates it. Then `publish_scratch` to the repository it reports, as above.";
 
-/// What the model is sent for `cycles` and the shipped name: the snapshot with both put in. The
-/// snapshot's final newline is dropped, as the loader drops it from every body
-/// (`adam-agent-fs` trims trailing whitespace).
+/// The section the assembly appends to the body for the skills (ADR 0044, decision 8): the catalog
+/// of the folder's skills, if it has any, and the sentence that every root agent with `RunSkills`
+/// gets. A pinned file, so the diff of a change to it is what a reviewer reads.
+const SKILLS: &str = include_str!("fixtures/agent/skills.txt");
+
+/// What the model is sent for `cycles` and the shipped name: the body (see [`expected_body`]) and
+/// the skills section the assembly appends after a blank line.
 fn expected_prompt(cycles: u32) -> String {
+    format!("{}\n\n{}", expected_body(cycles), SKILLS.trim_end())
+}
+
+/// The body of `agent/instructions.md` for `cycles` and the shipped name: the snapshot with both
+/// put in. The snapshot's final newline is dropped, as the loader drops it from every body
+/// (`adam-agent-fs` trims trailing whitespace). The 30,000 characters above which the loader warns
+/// count this and not the skills section.
+fn expected_body(cycles: u32) -> String {
     let rendered = SNAPSHOT
         .replace("{{max_check_cycles}}", &cycles.to_string())
         .replace("{{scratch_check_cycles}}", &SCRATCH_CYCLES.to_string())
@@ -80,10 +92,11 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
             !prompt.to_lowercase().contains("opencode"),
             "the prompt names OpenCode"
         );
+        let body = expected_body(cycles);
         assert!(
-            prompt.chars().count() < 30_000,
+            body.chars().count() < 30_000,
             "{} characters: the loader warns above 30,000",
-            prompt.chars().count()
+            body.chars().count()
         );
     }
     let files = include_str!("../agent/instructions.md");
@@ -95,7 +108,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 36] = [
+const TOOLS: [&str; 38] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -125,6 +138,10 @@ const TOOLS: [&str; 36] = [
     "plan_work",
     "plan_check",
     "plan_add",
+    // The two skill tools: the root always has them, so that what a run finds (the skills of a
+    // repository) is a tool result and the tool list never changes (ADR 0044, decision 8).
+    "load_skill",
+    "read_skill_file",
     "explorer",
     "reviewer",
     // The five that run a subagent in the background (ADR 0045), after the one tool per subagent.
@@ -145,7 +162,7 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     })
     .await;
     let tools = coder_tools(&fx.env);
-    assert_eq!(tools.len(), TOOLS.len() - 7, "the coder's and the screen's");
+    assert_eq!(tools.len(), TOOLS.len() - 9, "the coder's and the screen's");
     let mut titles = Vec::new();
     for tool in tools.iter() {
         let name = tool.spec().name;
@@ -400,7 +417,9 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
         info.tools, TOOLS,
         "the tools, in the order they are offered"
     );
-    assert!(info.skills.is_empty() && info.preloaded.is_empty());
+    // Its two skills, both left to `load_skill`: none is preloaded.
+    assert_eq!(info.skills, ["discover-checks", "pull-request-text"]);
+    assert!(info.preloaded.is_empty());
     // What `coder_limits()` returned.
     assert_eq!(
         info.limits,
@@ -649,11 +668,18 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     run_to_a_stop(&coder, "hi").await;
 
     let system = mock.requests()[0].system.clone().unwrap();
-    assert!(system.ends_with("\n\nAlways answer in French."), "{system}");
+    assert!(
+        system.contains("\n\nAlways answer in French.\n\n"),
+        "{system}"
+    );
     assert!(system.contains("at most 5 times"), "{system}");
     assert_eq!(
         system,
-        format!("{}\n\nAlways answer in French.", expected_prompt(5)),
+        format!(
+            "{}\n\nAlways answer in French.\n\n{}",
+            expected_body(5),
+            SKILLS.trim_end()
+        ),
         "the shipped prompt, and the edit"
     );
     // The embedded copy is what it was: the folder changed this process only.
@@ -756,6 +782,8 @@ async fn a_folder_may_narrow_the_tools() {
         [
             "run_command",
             "ask_user",
+            "load_skill",
+            "read_skill_file",
             "explorer",
             "reviewer",
             "subagent_start",
@@ -764,8 +792,8 @@ async fn a_folder_may_narrow_the_tools() {
             "subagent_close",
             "subagent_list"
         ],
-        "the tools of the folder's `tools:`, then one per subagent, then the five that run one in \
-         the background"
+        "the tools of the folder's `tools:`, the two skill tools (`tools:` does not filter them), \
+         then one per subagent, then the five that run one in the background"
     );
 }
 
@@ -1139,7 +1167,7 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     .expect("the folder assembles with its MCP tools");
     let tools = &agent.assembly().info()[0].tools;
     // The coder's own tools, the server's, then one per subagent and the five session tools.
-    let own = TOOLS.len() - 7;
+    let own = TOOLS.len() - 9;
     assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
     assert_eq!(&tools[..own], &TOOLS[..own]);
     assert_eq!(tools[own], "test__echo");
@@ -1476,5 +1504,85 @@ async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
             "2001\n2002\n2003\n[more: 27997 lines left; next page: offset=2004]".to_owned(),
             false
         )
+    );
+}
+
+/// The coder ships two skills of its own (ADR 0044, decision 8), written for it: each parses as the
+/// loader reads a skill with no finding, is short, says only what it can do (every tool it names is
+/// one the coder has) and is in the catalog of the prompt, which the pinned `skills.txt` holds.
+#[tokio::test]
+async fn the_coders_skills_parse_and_are_in_the_catalog() {
+    use adam::agent_fs::{SkillLayout, parse_skill};
+
+    let shipped = [
+        (
+            "discover-checks",
+            include_str!("../agent/skills/discover-checks/SKILL.md"),
+        ),
+        (
+            "pull-request-text",
+            include_str!("../agent/skills/pull-request-text/SKILL.md"),
+        ),
+    ];
+    let (_fx, agent) = coder(3).await;
+    let info = &agent.assembly().info()[0];
+    assert_eq!(
+        info.skills,
+        shipped.map(|(name, _)| name),
+        "the folder's skills, by name"
+    );
+    let tool_names: Vec<String> = info.tools.clone();
+    for (name, text) in shipped {
+        let mut findings = Vec::new();
+        let skill = parse_skill(
+            std::path::Path::new(&format!("agent/skills/{name}/SKILL.md")),
+            text,
+            name,
+            SkillLayout::Directory,
+            &mut findings,
+        )
+        .unwrap_or_else(|| panic!("{name} does not parse: {findings:?}"));
+        assert!(findings.is_empty(), "{name}: {findings:?}");
+        assert_eq!(skill.name, name);
+        assert!(
+            (40..=300).contains(&skill.description.chars().count()),
+            "{name}: a description the catalog can carry on every request: {}",
+            skill.description
+        );
+        assert!(
+            text.lines().count() <= 150,
+            "{name}: about 150 lines at most"
+        );
+        assert!(
+            !skill.body.to_lowercase().contains("opencode") && skill.body.contains("\n## "),
+            "{name}"
+        );
+        assert!(
+            info.prompt.contains(&format!(
+                "<name>{name}</name>\n    <description>{}</description>",
+                skill.description
+            )),
+            "{name} is in the catalog"
+        );
+        // The tools a skill names are the coder's: `snake_case` words in backticks.
+        for word in skill.body.split('`').skip(1).step_by(2) {
+            let is_name =
+                word.contains('_') && word.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            // `pull_request` is the name of a CI event, not a tool.
+            if is_name && word != "pull_request" {
+                assert!(
+                    tool_names.iter().any(|t| t == word),
+                    "{name} names `{word}`, which is not a tool of the coder"
+                );
+            }
+        }
+    }
+    // Neither skill bundles a file: the catalog is the whole section but for the fixed sentence.
+    assert!(!info.prompt.contains("<skill_resources>"));
+    assert!(info.prompt.ends_with(SKILLS.trim_end()));
+    // And no line was added to the instructions: the body is the snapshot.
+    assert_eq!(
+        info.prompt,
+        format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
     );
 }

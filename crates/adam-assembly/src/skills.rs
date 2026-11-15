@@ -24,6 +24,7 @@ use adam_agent_fs::{
     SkillSelection, Subagent,
 };
 use adam_error::{Classify, ErrorClass};
+use adam_llm_agent::paging::{self, PAGE_LINES, PageError, page_lines, window_args};
 use adam_llm_agent::{DynTool, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
@@ -311,7 +312,10 @@ impl SkillSet {
     ///   </skill>
     /// </available_skills>
     /// ```
-    pub(crate) fn prompt_section(&self) -> String {
+    ///
+    /// With `run` (the agent has [`RunSkills`]) the section ends with [`OTHER_SKILLS`], and an agent
+    /// with no skill of its own has that sentence alone.
+    pub(crate) fn prompt_section(&self, run: bool) -> String {
         let mut sections: Vec<String> = Vec::new();
         if self.has_load_tool() {
             let mut s = String::from(
@@ -361,84 +365,49 @@ impl SkillSet {
             }
             sections.push(s);
         }
+        if run {
+            sections.push(OTHER_SKILLS.to_owned());
+        }
         sections.join("\n\n")
     }
 
+    /// A set with no skill: what an agent that is only given [`RunSkills`] has.
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
     /// The tools this set adds: `load_skill` when a skill is left to load, and `read_skill_file`
-    /// when a selected skill bundles a file.
-    pub(crate) fn tools(self: &Arc<Self>) -> Vec<DynTool> {
+    /// when a selected skill bundles a file. With `run` both are always there, so that the tool
+    /// list never depends on what a run finds.
+    pub(crate) fn tools(self: &Arc<Self>, run: Option<&RunSkillsHandle>) -> Vec<DynTool> {
         let mut tools: Vec<DynTool> = Vec::new();
-        if self.has_load_tool() {
+        if run.is_some() || self.has_load_tool() {
             tools.push(Arc::new(LoadSkill {
                 set: Arc::clone(self),
-                spec: self.load_spec(),
+                run: run.cloned(),
             }));
         }
-        if self.has_read_tool() {
+        if run.is_some() || self.has_read_tool() {
             tools.push(Arc::new(ReadSkillFile {
                 set: Arc::clone(self),
-                spec: self.read_spec(),
+                run: run.cloned(),
             }));
         }
         tools
     }
 
-    fn load_spec(&self) -> ToolSpec {
-        let names: Vec<&str> = self.loadable().map(|e| e.name.as_str()).collect();
-        ToolSpec {
-            name: LOAD_SKILL.into(),
-            description: "Load the full instructions of one of your skills. Call it when a task \
-                          matches the description of a skill in the available_skills list."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "enum": names,
-                        "description": "The name of the skill to load."
-                    }
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn read_spec(&self) -> ToolSpec {
-        let names: Vec<&str> = self.with_files().map(|e| e.name.as_str()).collect();
-        ToolSpec {
-            name: READ_SKILL_FILE.into(),
-            description: "Read a text file bundled with one of your skills: a path listed under \
-                          skill_resources when the skill was loaded."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "skill": {
-                        "type": "string",
-                        "enum": names,
-                        "description": "The skill the file belongs to."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "The file's path relative to the skill's directory, \
-                                        for example references/style.md."
-                    }
-                },
-                "required": ["skill", "path"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    /// The tier 2 result: the body of the skill and the list of its files.
-    fn load(&self, name: &str) -> Result<String, SkillError> {
+    /// The tier 2 result: a page of the body of the skill and the list of its files.
+    fn load(&self, name: &str, offset: i64, limit: u32) -> Result<String, SkillError> {
         match self.entries.iter().find(|e| e.name == name) {
             Some(entry) if entry.preloaded => Err(SkillError::AlreadyLoaded {
                 skill: name.to_owned(),
             }),
-            Some(entry) => Ok(content(entry)),
+            Some(entry) => {
+                let page = paged(name, &format!("{}\n", content(entry)), offset, limit)?;
+                Ok(with_files_note(page, entry, offset))
+            }
             None => Err(SkillError::UnknownSkill {
                 skill: name.to_owned(),
                 suggestion: closest(name, self.loadable().map(|e| e.name.as_str()))
@@ -448,8 +417,8 @@ impl SkillSet {
         }
     }
 
-    /// The tier 3 result: the text of one bundled file.
-    fn read(&self, skill: &str, path: &str) -> Result<String, SkillError> {
+    /// The tier 3 result: a page of the text of one bundled file.
+    fn read(&self, skill: &str, path: &str, offset: i64, limit: u32) -> Result<String, SkillError> {
         let Some(entry) = self.entries.iter().find(|e| e.name == skill) else {
             return Err(SkillError::UnknownSkill {
                 skill: skill.to_owned(),
@@ -467,11 +436,14 @@ impl SkillSet {
             });
         };
         match std::str::from_utf8(bytes) {
-            Ok(text) if !text.contains('\0') => Ok(if text.is_empty() {
-                "(the file is empty)".to_owned()
-            } else {
-                text.to_owned()
-            }),
+            Ok(text) if !text.contains('\0') => {
+                let page = paged(path, text, offset, limit)?;
+                Ok(if text.is_empty() {
+                    format!("(the file is empty)\n{page}")
+                } else {
+                    page
+                })
+            }
             _ => Err(SkillError::NotText {
                 skill: skill.to_owned(),
                 path: path.to_owned(),
@@ -479,6 +451,113 @@ impl SkillSet {
             }),
         }
     }
+}
+
+/// Most bundled files a first page lists when the body goes on.
+const MAX_LISTED_FILES: usize = 200;
+
+/// `load_skill`'s description and schema: the same whatever skills exist, so the tool list of a
+/// run never depends on them.
+fn load_spec() -> ToolSpec {
+    ToolSpec {
+        name: LOAD_SKILL.into(),
+        description: "Load the instructions of one of your skills, a page of lines at a time: \
+                      the last line of the result says where the next page starts. Call it when \
+                      a task matches the description of a skill in the available_skills list. \
+                      The same name, offset and limit give the same page."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the skill to load."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "First line, from 1; -50 = the last 50 lines"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Most lines (at most 2000)"
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// `read_skill_file`'s description and schema: fixed, like [`load_spec`].
+fn read_spec() -> ToolSpec {
+    ToolSpec {
+        name: READ_SKILL_FILE.into(),
+        description: "Read a text file bundled with one of your skills, a page of lines at a \
+                      time: a path listed under skill_resources when the skill was loaded. The \
+                      last line of the result says where the next page starts."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "The skill the file belongs to."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The file's path relative to the skill's directory, \
+                                    for example references/style.md."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "First line, from 1; -50 = the last 50 lines"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Most lines (at most 2000)"
+                }
+            },
+            "required": ["skill", "path"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// One page of `text`: its lines, then the line that says where the next page starts.
+fn paged(what: &str, text: &str, offset: i64, limit: u32) -> Result<String, SkillError> {
+    match page_lines(std::io::Cursor::new(text.as_bytes()), offset, limit, false) {
+        Ok(page) => Ok(page.render()),
+        Err(PageError::PastEnd { offset, total }) => Err(SkillError::Window(format!(
+            "`{what}` has {total} lines: offset {offset} is past the end"
+        ))),
+        Err(other) => Err(SkillError::Window(format!("`{what}`: {other}"))),
+    }
+}
+
+/// The first page of a body that goes on names the files the skill bundles (the list inside
+/// `<skill_content>` comes with the last page): one line before the paging line.
+fn with_files_note(page: String, entry: &Entry, offset: i64) -> String {
+    if offset != 1 || entry.files.is_empty() {
+        return page;
+    }
+    let Some((body, last)) = page.rsplit_once('\n') else {
+        return page;
+    };
+    if !last.starts_with("[more:") {
+        return page;
+    }
+    let mut note = String::from("Files this skill bundles (read one with read_skill_file):");
+    for (path, _) in entry.files.iter().take(MAX_LISTED_FILES) {
+        let _ = write!(note, " {}", paging::escape_name(path.as_bytes()));
+    }
+    if entry.files.len() > MAX_LISTED_FILES {
+        let _ = write!(
+            note,
+            " ... and {} more",
+            entry.files.len() - MAX_LISTED_FILES
+        );
+    }
+    format!("{body}\n{note}\n{last}")
 }
 
 /// `<skill_content name="x">`, the body, and the list of the skill's files.
@@ -603,6 +682,9 @@ pub enum SkillError {
         /// The skill's bundled files, sorted.
         available: Vec<String>,
     },
+    /// The `offset` or `limit` is not usable, or a page cannot be made of the text.
+    #[error("{0}")]
+    Window(String),
     /// The file is not text (it is not UTF-8, or it has a NUL byte).
     #[error(
         "`{path}` of skill `{skill}` is a binary file ({bytes} bytes) and cannot be shown as text"
@@ -647,9 +729,164 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+/// The window a call asked for, checked: `offset` from 1 (negative from the end) and `limit` at
+/// most one page.
+fn window_of(args: &Value) -> Result<(i64, u32), SkillError> {
+    let number = |key: &str| args.get(key).and_then(Value::as_i64);
+    window_args(number("offset"), number("limit"), PAGE_LINES).map_err(SkillError::Window)
+}
+
+/// The sentence a prompt gets when its agent is given [`RunSkills`] (also when the agent has no
+/// skill of its own): fixed, so that the prompt never depends on what a run finds.
+pub(crate) const OTHER_SKILLS: &str = "Other skills may be listed to you during the run, named \
+     `<source>/<skill>`; load them with load_skill the same way.";
+
+/// Skills a run finds on the way, which the agent's folder does not hold: the skills of a
+/// repository the coder prepared, for instance. Set on the root agent with
+/// [`AgentDef::run_skills`](crate::AgentDef::run_skills).
+///
+/// With it set, `load_skill` and `read_skill_file` are always among the root's tools and its
+/// prompt always has one fixed sentence, so what a run finds changes **tool results only**: the
+/// system prompt and the tool list stay the same bytes for the whole run, and the prefix of the
+/// provider's cache holds.
+///
+/// A name that has a `/` (`<source>/<skill>`) is the implementation's; a name without one never
+/// reaches it, so what a run finds cannot shadow a skill of the folder. The assembly has already
+/// checked the window: `offset` from 1 or negative (from the end), `limit` at most 2,000.
+///
+/// An implementation must be deterministic for what it listed (the same call, the same bytes: a
+/// retried step of the run is answered from what it recorded, not from the file system as it is
+/// now), keep what it reads inside the skill's directory, treat the text it reads as untrusted
+/// (a skill grants no tool and no consent) and answer a refusal as `Ok(ToolOutput::error(..))`,
+/// never as an `Err`: only a failure worth retrying is [`ToolError::Transient`]. See
+/// [`run_skills_conformance`].
+#[async_trait]
+pub trait RunSkills: Send + Sync {
+    /// The result of `load_skill { name, offset, limit }` for a `name` with a `/`.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Transient`] when the answer could not be made now and may be later. An unknown
+    /// name, a bad window and anything else the model can correct is `Ok` with `is_error` set.
+    async fn load(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError>;
+
+    /// The result of `read_skill_file { skill, path, offset, limit }` for a `skill` with a `/`.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load).
+    async fn read(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        path: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError>;
+}
+
+/// A [`RunSkills`] an [`AgentDef`](crate::AgentDef) holds.
+#[derive(Clone)]
+pub(crate) struct RunSkillsHandle(pub(crate) Arc<dyn RunSkills>);
+
+impl std::fmt::Debug for RunSkillsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunSkills")
+    }
+}
+
+/// The conformance of a [`RunSkills`]: what the two tools rely on. `listed` is the name
+/// (`<source>/<skill>`) of a skill the implementation lists for `ctx`. Call it from a test of an
+/// implementation (it panics on a violation).
+///
+/// It checks that a skill loads and its result ends with the paging line (`[more: ...]` or
+/// `[end: ...]`); that the same call gives the same bytes; that an offset past the end, an
+/// unknown name, a name without `/` and a path that leaves the skill's directory or is absolute or
+/// missing are refused as results with `is_error`, not as errors.
+///
+/// # Panics
+///
+/// When `skills` does not behave as the trait says.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub async fn run_skills_conformance(skills: &dyn RunSkills, ctx: &ToolCtx, listed: &str) {
+    assert!(
+        listed.contains('/') && is_skill_name_of(listed),
+        "`listed` must be `<source>/<skill>`: {listed}"
+    );
+
+    let first = skills.load(ctx, listed, 1, PAGE_LINES).await.unwrap();
+    assert!(!first.is_error, "a listed skill loads: {}", first.content);
+    let last = first.content.rsplit('\n').next().unwrap();
+    assert!(
+        last.starts_with('[')
+            && last.ends_with(']')
+            && (last.contains("more:") || last.contains("end:")),
+        "a result ends with the paging line: {last:?}"
+    );
+    assert_eq!(
+        first.content.matches("\n[").count() + usize::from(first.content.starts_with('[')),
+        1,
+        "only the paging line starts with `[`: {}",
+        first.content
+    );
+
+    let again = skills.load(ctx, listed, 1, PAGE_LINES).await.unwrap();
+    assert_eq!(
+        first.content, again.content,
+        "the same call, the same bytes"
+    );
+
+    let refused = |what: &str, out: Result<ToolOutput, ToolError>| {
+        let out = out.unwrap_or_else(|e| panic!("{what} is a result, not an error: {e}"));
+        assert!(out.is_error, "{what} is refused: {}", out.content);
+    };
+    refused(
+        "an offset past the end",
+        skills.load(ctx, listed, 1_000_000, 10).await,
+    );
+    refused(
+        "an unknown skill",
+        skills
+            .load(ctx, &format!("{listed}-no-such-skill"), 1, 10)
+            .await,
+    );
+    refused(
+        "a name without a `/`",
+        skills.load(ctx, "plain", 1, 10).await,
+    );
+    refused(
+        "a file of a name without a `/`",
+        skills.read(ctx, "plain", "x", 1, 10).await,
+    );
+    refused(
+        "a path that leaves the skill",
+        skills.read(ctx, listed, "../outside", 1, 10).await,
+    );
+    refused(
+        "an absolute path",
+        skills.read(ctx, listed, "/etc/passwd", 1, 10).await,
+    );
+    refused(
+        "a file the skill does not have",
+        skills.read(ctx, listed, "no-such-file.txt", 1, 10).await,
+    );
+}
+
+fn is_skill_name_of(qualified: &str) -> bool {
+    qualified
+        .split_once('/')
+        .is_some_and(|(source, skill)| !source.is_empty() && adam_agent_fs::is_skill_name(skill))
+}
+
 struct LoadSkill {
     set: Arc<SkillSet>,
-    spec: ToolSpec,
+    run: Option<RunSkillsHandle>,
 }
 
 #[async_trait]
@@ -660,23 +897,35 @@ impl Tool for LoadSkill {
     }
 
     fn spec(&self) -> ToolSpec {
-        self.spec.clone()
+        load_spec()
     }
 
-    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        answer(match string_arg(&args, "name") {
-            Some(name) => self.set.load(name),
-            None => Err(SkillError::BadArguments {
+    /// A page of a long skill is read with the same call and a later `offset`.
+    fn paged(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let Some(name) = string_arg(&args, "name") else {
+            return answer(Err(SkillError::BadArguments {
                 tool: LOAD_SKILL,
                 expected: "a string argument `name`",
-            }),
-        })
+            }));
+        };
+        let (offset, limit) = match window_of(&args) {
+            Ok(window) => window,
+            Err(refusal) => return answer(Err(refusal)),
+        };
+        match &self.run {
+            Some(run) if name.contains('/') => run.0.load(ctx, name, offset, limit).await,
+            _ => answer(self.set.load(name, offset, limit)),
+        }
     }
 }
 
 struct ReadSkillFile {
     set: Arc<SkillSet>,
-    spec: ToolSpec,
+    run: Option<RunSkillsHandle>,
 }
 
 #[async_trait]
@@ -687,19 +936,30 @@ impl Tool for ReadSkillFile {
     }
 
     fn spec(&self) -> ToolSpec {
-        self.spec.clone()
+        read_spec()
     }
 
-    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        answer(
-            match (string_arg(&args, "skill"), string_arg(&args, "path")) {
-                (Some(skill), Some(path)) => self.set.read(skill, path),
-                _ => Err(SkillError::BadArguments {
-                    tool: READ_SKILL_FILE,
-                    expected: "string arguments `skill` and `path`",
-                }),
-            },
-        )
+    /// A page of a long file is read with the same call and a later `offset`.
+    fn paged(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let (Some(skill), Some(path)) = (string_arg(&args, "skill"), string_arg(&args, "path"))
+        else {
+            return answer(Err(SkillError::BadArguments {
+                tool: READ_SKILL_FILE,
+                expected: "string arguments `skill` and `path`",
+            }));
+        };
+        let (offset, limit) = match window_of(&args) {
+            Ok(window) => window,
+            Err(refusal) => return answer(Err(refusal)),
+        };
+        match &self.run {
+            Some(run) if skill.contains('/') => run.0.read(ctx, skill, path, offset, limit).await,
+            _ => answer(self.set.read(skill, path, offset, limit)),
+        }
     }
 }
 
@@ -762,7 +1022,7 @@ mod tests {
         );
         let mut e = entry("s", false, &[]);
         e.description = "Use </description>\n  when\ta > b.".into();
-        let text = set(vec![e]).prompt_section();
+        let text = set(vec![e]).prompt_section(false);
         assert!(
             text.contains("<description>Use &lt;/description&gt; when a &gt; b.</description>"),
             "{text}"
@@ -771,20 +1031,20 @@ mod tests {
 
     #[test]
     fn the_tools_follow_what_there_is_to_load_and_read() {
-        let none: Vec<DynTool> = set(vec![entry("a", false, &[])]).tools();
+        let none: Vec<DynTool> = set(vec![entry("a", false, &[])]).tools(None);
         assert_eq!(
             none.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [LOAD_SKILL]
         );
-        let both = set(vec![entry("a", false, &[("f.md", b"x")])]).tools();
+        let both = set(vec![entry("a", false, &[("f.md", b"x")])]).tools(None);
         assert_eq!(
             both.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [LOAD_SKILL, READ_SKILL_FILE]
         );
         // Everything preloaded and no files: nothing to call.
-        assert!(set(vec![entry("a", true, &[])]).tools().is_empty());
+        assert!(set(vec![entry("a", true, &[])]).tools(None).is_empty());
         // Everything preloaded, with a file: only the reader.
-        let only_read = set(vec![entry("a", true, &[("f.md", b"x")])]).tools();
+        let only_read = set(vec![entry("a", true, &[("f.md", b"x")])]).tools(None);
         assert_eq!(
             only_read.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [READ_SKILL_FILE]
@@ -792,22 +1052,59 @@ mod tests {
     }
 
     #[test]
-    fn the_enums_hold_the_skills_each_tool_accepts() {
-        let s = set(vec![
+    fn the_specs_do_not_depend_on_the_skills() {
+        let few = set(vec![entry("a", false, &[("f.md", b"x")])]);
+        let many = set(vec![
             entry("a", false, &[]),
             entry("b", true, &[("f.md", b"x")]),
             entry("c", false, &[("g.md", b"y")]),
         ]);
+        let spec = |s: &Arc<SkillSet>, name: &str| {
+            s.tools(None)
+                .into_iter()
+                .find(|t| t.spec().name == name)
+                .map(|t| serde_json::to_string(&t.spec()).unwrap())
+                .unwrap()
+        };
+        for tool in [LOAD_SKILL, READ_SKILL_FILE] {
+            assert_eq!(spec(&few, tool), spec(&many, tool), "{tool}");
+        }
+        let load = load_spec();
+        assert!(load.parameters["properties"]["name"]["enum"].is_null());
+        assert!(load.parameters["properties"]["offset"].is_object());
+        assert!(load.parameters["properties"]["limit"].is_object());
+        assert!(read_spec().parameters["properties"]["skill"]["enum"].is_null());
+        assert_eq!(many.names(), ["a", "b", "c"]);
+        assert_eq!(many.preloaded(), ["b"]);
+    }
+
+    #[test]
+    fn a_long_body_is_cut_at_a_page_and_says_where_the_next_starts() {
+        let mut long = entry("long", false, &[("f.md", b"x")]);
+        long.body = (1..=5)
+            .map(|n| format!("row {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s = set(vec![long]);
+        let first = s.load("long", 1, 3).unwrap();
         assert_eq!(
-            s.load_spec().parameters["properties"]["name"]["enum"],
-            json!(["a", "c"])
+            first,
+            "<skill_content name=\"long\">\nrow 1\nrow 2\n\
+             Files this skill bundles (read one with read_skill_file): f.md\n\
+             [more: 9 lines left; next page: offset=4]"
         );
-        assert_eq!(
-            s.read_spec().parameters["properties"]["skill"]["enum"],
-            json!(["b", "c"])
+        let last = s.load("long", 9, 100).unwrap();
+        assert!(
+            last.ends_with("</skill_content>\n[end: 12 lines]"),
+            "{last}"
         );
-        assert_eq!(s.names(), ["a", "b", "c"]);
-        assert_eq!(s.preloaded(), ["b"]);
+        assert!(!last.contains("Files this skill bundles"), "{last}");
+        let from_end = s.load("long", -2, 100).unwrap();
+        assert!(from_end.ends_with("</skill_resources>\n</skill_content>\n[end: 12 lines]"));
+        assert!(matches!(
+            s.load("long", 13, 3),
+            Err(SkillError::Window(w)) if w.contains("past the end")
+        ));
     }
 
     #[test]
@@ -816,20 +1113,20 @@ mod tests {
             entry("alpha", false, &[("references/x.md", b"x")]),
             entry("beta", true, &[]),
         ]);
-        let text = s.load("alpha").unwrap();
+        let text = s.load("alpha", 1, 2000).unwrap();
         assert_eq!(
             text,
             "<skill_content name=\"alpha\">\nSteps of alpha.\n\n\
              Relative paths in this skill are relative to the skill's directory.\n\
-             <skill_resources>\n  <file>references/x.md</file>\n</skill_resources>\n</skill_content>"
+             <skill_resources>\n  <file>references/x.md</file>\n</skill_resources>\n</skill_content>\n[end: 8 lines]"
         );
         assert_eq!(
-            s.load("beta"),
+            s.load("beta", 1, 2000),
             Err(SkillError::AlreadyLoaded {
                 skill: "beta".into()
             })
         );
-        let unknown = s.load("alph").unwrap_err();
+        let unknown = s.load("alph", 1, 2000).unwrap_err();
         assert_eq!(
             unknown.to_string(),
             "no skill `alph` is available to you; did you mean `alpha`?; available: `alpha`"
@@ -851,35 +1148,47 @@ mod tests {
             ),
             entry("plain", false, &[]),
         ]);
-        assert_eq!(s.read("a", "t.md").unwrap(), "héllo");
-        assert_eq!(s.read("a", "./t.md").unwrap(), "héllo");
-        assert_eq!(s.read("a", "empty").unwrap(), "(the file is empty)");
+        assert_eq!(
+            s.read("a", "t.md", 1, 2000).unwrap(),
+            "héllo\n[end: 1 lines; no newline at the end of the file]"
+        );
+        assert_eq!(
+            s.read("a", "./t.md", 1, 2000).unwrap(),
+            "héllo\n[end: 1 lines; no newline at the end of the file]"
+        );
+        assert_eq!(
+            s.read("a", "empty", 1, 2000).unwrap(),
+            "(the file is empty)\n[end: 0 lines]"
+        );
         for binary in ["bin", "nul"] {
             assert!(
-                matches!(s.read("a", binary), Err(SkillError::NotText { .. })),
+                matches!(
+                    s.read("a", binary, 1, 2000),
+                    Err(SkillError::NotText { .. })
+                ),
                 "{binary}"
             );
         }
-        let missing = s.read("a", "T.md").unwrap_err();
+        let missing = s.read("a", "T.md", 1, 2000).unwrap_err();
         assert_eq!(
             missing.to_string(),
             "skill `a` has no file `T.md`; its files: `bin`, `empty`, `nul`, `t.md`"
         );
         assert!(
-            s.read("plain", "x")
+            s.read("plain", "x", 1, 2000)
                 .unwrap_err()
                 .to_string()
                 .ends_with("the skill bundles no files")
         );
         assert!(
-            s.read("plain", "SKILL.md")
+            s.read("plain", "SKILL.md", 1, 2000)
                 .unwrap_err()
                 .to_string()
                 .ends_with(
                     "the skill bundles no files; its instructions are loaded with load_skill"
                 )
         );
-        let unknown = s.read("b", "x").unwrap_err();
+        let unknown = s.read("b", "x", 1, 2000).unwrap_err();
         assert_eq!(
             unknown.to_string(),
             "no skill `b` is available to you; available: `a`"
@@ -895,6 +1204,7 @@ mod tests {
                 expected: "a string argument `name`",
             },
             SkillError::EmptyPath,
+            SkillError::Window("offset counts from 1".into()),
             SkillError::AbsolutePath { path: "/x".into() },
             SkillError::PathTraversal {
                 path: "../x".into(),

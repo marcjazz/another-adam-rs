@@ -54,11 +54,12 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
-| `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads |
+| `RunSkills`, `run_skills_conformance` | the trait of the skills a run finds (`load` and `read` take the context, a `<source>/<skill>` name and a checked window), and the function that checks an implementation (Rule 2) |
+| `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads (`Window` is a bad `offset` or `limit`, or an offset past the end: a new variant, so a `match` on it breaks) |
 | `BoundDef` | `state(Arc<T>)`, `tool_source(source)` (a `ToolSource` of `adam-llm-agent` for every agent: tools it learns about while it runs, offered at every model turn after the agent's own; `tools:` does not narrow it), `model_aliases(..)`, `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `scrub(f)` (a function that scrubs secrets out of what the five session tools give the model, which `bind` makes itself and a deployment's own tool wrapper never sees: the coder gives its redactor), `scrub_longest(f)` (the length of the longest value it replaces, for `ToolCtx::scrub_margin`, as the coder's own wrapper passes it; a report is a child's text scrubbed whole, never a cut one, so no open edge applies), `step_io(StepIo)` (how every agent's tool-call steps report their input and output, and what is scrubbed from them first: `LlmAgentBuilder::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)), `model(DynModel, alias)` |
 | `adam_llm_agent::ReadOutput` | **added by `bind` to every agent whose tools include an MCP tool** (unless its tool list already holds `read_output`, as the coder's does), after the tools it selected: a long MCP result is kept and the model reads the rest with `read_output { id, offset?, limit? }` (an agent that is only a folder keeps it in the run's state, 4 MiB; see [`adam-mcp`](../adam-mcp/README.md)). An agent with no MCP tool among its tools does not get it |
 | `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one. Its call is a `subagent` step drawn as an agent (`Tool::step_style`), as is a remote subagent's, **labelled with the tool's name as a person reads it** (`explorer` is "Explorer", `code_reviewer` is "Code reviewer"). `load_skill` and `read_skill_file` are "Load a skill" and "Read a skill file" |
@@ -196,7 +197,7 @@ Files a skill bundles are listed under <skill_resources> when it is loaded; read
 The third line is there only when a selected skill bundles a file. A description is collapsed to one line
 and `&`, `<`, `>` are escaped. Skills that are preloaded are not listed.
 
-**Tier 2, `load_skill { name }`.** `name` is an enum of the skills left to load. It returns
+**Tier 2, `load_skill { name, offset?, limit? }`.** `name` is a string, never an enum: the description and schema of the tool are the same whatever skills exist (an unknown name is answered with the list of those that do). It pages like `read_file`: at most 2,000 lines or 50 KiB a page, `offset` from 1 (negative from the end), and every result ends with the line that says where the next page starts, `[more: N lines left; next page: offset=K]` or `[end: N lines]`. The text it pages is
 
 ```text
 <skill_content name="release-notes">
@@ -210,13 +211,13 @@ Relative paths in this skill are relative to the skill's directory.
 </skill_content>
 ```
 
-(the last two blocks only for a skill with files; the list is sorted, and lists files without reading them).
+(the last two blocks only for a skill with files; the list is sorted, and lists files without reading them, and comes with the last page of a body that goes on; the first page of such a body names the files in one line before its paging line). A line of the body that starts with `[` is shown with `\x5b`, so that only the last line of a page starts with `[`.
 
-**Tier 3, `read_skill_file { skill, path }`.** `skill` is an enum of the skills that bundle a file. The
+**Tier 3, `read_skill_file { skill, path, offset?, limit? }`.** `skill` is a string (no enum). The
 path is normalised (a leading `./` is dropped) and refused when it is empty, absolute (`/x`, `\x`, `C:`), has
 a `..` component, a backslash or a control character. What passes is looked up by exact match in the
 skill's list of files, so nothing outside the list is reachable and there is no file system access at run
-time. A **text** file (UTF-8, no NUL byte) is returned as it is (an empty one as `(the file is empty)`); a
+time. A **text** file (UTF-8, no NUL byte) is paged like a body (an empty one is `(the file is empty)` and `[end: 0 lines]`); a
 **binary** file is refused with its size. A skill bundles at most 1 MiB (`SKILL_RESOURCE_LIMIT`, checked by
 the build script and again when the bytes are loaded), which bounds any result.
 
@@ -226,7 +227,7 @@ skill gets the same answer as a made-up one.
 
 **`preload_skills: [a]`** puts `<skill_content name="a">` in the prompt after the catalog, under the line
 "The following skills are already loaded. ...", instead of leaving it to `load_skill`. A preloaded skill
-must be selected by `skills:`; it leaves the catalog and the `load_skill` enum (asking for it says it is
+must be selected by `skills:`; it leaves the catalog (asking for it says it is
 already in the instructions), and its files stay readable. With every skill preloaded there is no
 `load_skill`, and with no skill bundling a file there is no `read_skill_file`.
 
@@ -251,6 +252,32 @@ results are journaled with the step that ran them.
 Known limit: a loaded skill is a tool result, and the loop may truncate an old one to fit
 `limits.max_history_tokens`. `preload_skills` is the way around it until the loop learns to protect skill
 content.
+
+### Skills a run finds (`RunSkills`)
+
+A host that finds skills **during a run** (the coder: the skills of a repository it prepared) gives the root
+agent `AgentDef::run_skills(Arc<dyn RunSkills>)`. The two tools then take names the folder does not hold:
+
+| Call | Goes to |
+|---|---|
+| `load_skill { name }` or `read_skill_file { skill, .. }` with a `/` in the name (`<source>/<skill>`) | `RunSkills::load` / `RunSkills::read`, with the window already checked (`offset` from 1 or negative, `limit` at most 2,000) |
+| a name without a `/` | the folder's own skills, never `RunSkills`, so what a run finds cannot shadow a skill of the folder; an unknown one is answered with the list of the folder's |
+
+* **The tool list and the prompt never depend on the run.** With it set the root always has both tools and its
+  prompt ends with one fixed sentence ("Other skills may be listed to you during the run, named
+  `<source>/<skill>`; load them with load_skill the same way."), also when the folder has no skill of its own.
+  What a run finds arrives as a tool result, so the prefix of the provider's cache holds for the whole run.
+* **`skills: []` turns it off too:** no tool, no sentence, and the implementation is never called. A host
+  that lists skills itself must check the same thing.
+* **Root only.** A subagent gets none: its skills are its own.
+* **A contract for the implementation** (`run_skills_conformance` checks it): the same call gives the same
+  bytes (a retried step is answered from what the host recorded, not from the file system as it is now);
+  only the last line of a result starts with `[`; a refusal is `Ok(ToolOutput::error(..))`, and only a
+  failure worth retrying is `Err(ToolError::Transient)`; a path never leaves the skill's directory; what
+  it reads is the repository's text, never the person's, and grants no tool, access tier or consent.
+
+`RunSkills` is a new public trait, `AgentDef::run_skills` a new method and `SkillError::Window` a new variant
+of a closed enum (a `match` on it breaks).
 
 ## Run-time folders (no feature)
 
