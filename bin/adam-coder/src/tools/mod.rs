@@ -91,7 +91,7 @@ use std::time::Duration;
 
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
-use adam::{DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
+use adam::{AnswerCheck, DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
 use adam_a2a::AccessTier;
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
@@ -881,6 +881,16 @@ impl Tool for Gated {
         self.inner.step_style()
     }
 
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        self.inner.read_answer(call_id, args, ui, payload)
+    }
+
     /// A tool that has a bound of its own declares that bound and half a minute more, so the
     /// bound, which says what happened, fires first ([`own_limit`]); the agent's default applies
     /// only to a tool with none, and every such tool is named in [`QUICK_TOOLS`].
@@ -1013,6 +1023,21 @@ impl Tool for Redacting {
 
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
+    }
+
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        // A refusal and an ending are made from the call's own arguments, which are not scrubbed:
+        // they are scrubbed like the question the call asked.
+        let r = &self.redactor;
+        self.inner
+            .read_answer(call_id, args, ui, payload)
+            .scrubbed(|text| r.scrub_string(text), |ui| r.scrub_value(ui))
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

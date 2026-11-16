@@ -151,17 +151,21 @@ fn components(
     Ok(made)
 }
 
-/// What `show` is, before the screen says which components it has.
+/// What `show` is, before the screen says which components it has: when to use it and when not,
+/// what the person sees, the limits and one example.
 fn base_description() -> String {
     format!(
         "Show the person something on their screen, beside your text answer: a list of blocks, \
          each a component of the screen with its properties, drawn one under the other (at most \
-         {MAX_BLOCKS}). Call `ui_catalog` first to learn the components and their properties; \
-         a block that breaks a component's schema is refused with the reason, and you can \
-         correct it. Use it when a card, a list or a diagram says it better than text; the \
-         result is \"Shown to the person.\", and you still answer in text. \
-         Never use it to ask the person something: a `{CHOICES}` form drawn here has nobody to answer \
-         it, so `show` refuses it. Ask with `ask_user`, which takes `choices`."
+         {MAX_BLOCKS}). Use it when an arrangement says it better than text: a table or cards, a \
+         diagram, a diff, a picture of a file you shared (an `Image` block names its sha256, which \
+         `share_file` returns). A file to keep goes with `share_file`, and a short answer stays in \
+         your text. Never use it to ask the person something: a `{CHOICES}` form drawn here has \
+         nobody to answer it, so `show` refuses it. Ask with `ask_user`, which takes `choices`. \
+         Call `ui_catalog` first; a block that breaks a component's schema is refused with the \
+         reason, and you can correct it. The result is \"Shown to the person.\", and you still \
+         answer in text. Example: {{\"blocks\": [{{\"component\": \"Callout\", \"tone\": \
+         \"warning\", \"title\": \"Two tests fail\", \"text\": \"Both are in the parser.\"}}]}}"
     )
 }
 

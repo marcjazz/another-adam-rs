@@ -116,6 +116,35 @@ pub trait Tool: Send + Sync + 'static {
         StepStyle::default()
     }
 
+    /// Whether the answer to this tool's own question may be acted on: the loop asks before it
+    /// hands the answer to the model.
+    ///
+    /// The run is parked on a [`ToolError::NeedsInput`] of this tool and a message has arrived.
+    /// `call_id` and `args` are the call that asked, as the model made it (the history already
+    /// holds them, so the question needs no field of its own to be rebuilt), `ui` is the interface
+    /// that went with the question, and `payload` is the inbound message's payload: when the person
+    /// answered a form, its `form` member holds the form's `surface` and the action's `context`
+    /// (`adam_a2a_runtime::PAYLOAD_FORM`). Words alone, and a question that went out as text, carry
+    /// no `form`.
+    ///
+    /// [`AnswerCheck::Accept`], the default, hands the answer over as it came. [`AnswerCheck::Read`]
+    /// hands over the words the tool read it as. [`AnswerCheck::Refuse`] keeps the run parked on a
+    /// new question (the refusal's words and interface) and gives the model nothing: it never sees
+    /// the refused answer, and no result is recorded for the call. [`AnswerCheck::End`] stops
+    /// asking: the call ends with an error result and the model carries on.
+    /// The check is a pure function of its arguments, so a replay refuses what it refused.
+    /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it.
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        let _ = (call_id, args, ui, payload);
+        AnswerCheck::Accept
+    }
+
     /// How a task this tool started on another system stands. Only a tool that returns
     /// [`ToolError::AwaitRemote`] implements it.
     ///
@@ -136,6 +165,92 @@ pub trait Tool: Send + Sync + 'static {
             "tool `{}` does not wait on remote tasks",
             self.spec().name
         )))
+    }
+}
+
+/// What a tool says about an answer to its own question: see [`Tool::read_answer`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AnswerCheck {
+    /// Hand the answer to the model as the result of the call.
+    Accept,
+    /// Hand the model these words as the result of the call, in place of the answer's own: what the
+    /// tool read the answer as.
+    Read(String),
+    /// The answer is not used: ask again.
+    Refuse(Refusal),
+    /// The answer is not used and the question is not asked again: the call ends with
+    /// `Refusal::question` as its error result, which the model reads, and the run carries on.
+    /// `Refusal::ui` is not used. The refusal is journaled like any other.
+    End(Refusal),
+}
+
+impl AnswerCheck {
+    /// The same check with every text the person or the model will read passed through `text`, and
+    /// every interface through `ui`: for a wrapper that hides secrets (a [`Refusal`] is made from the
+    /// call's own arguments, which a scrub has not seen).
+    #[must_use]
+    pub fn scrubbed(
+        self,
+        mut text: impl FnMut(String) -> String,
+        mut ui: impl FnMut(&mut Value),
+    ) -> Self {
+        let mut scrub_refusal = |refusal: Refusal, text: &mut dyn FnMut(String) -> String| {
+            let Refusal {
+                question,
+                ui: mut interface,
+                rule,
+                subject,
+            } = refusal;
+            if let Some(interface) = &mut interface {
+                ui(interface);
+            }
+            Refusal {
+                question: text(question),
+                ui: interface,
+                rule,
+                subject,
+            }
+        };
+        match self {
+            Self::Accept => Self::Accept,
+            Self::Read(said) => Self::Read(text(said)),
+            Self::Refuse(refusal) => Self::Refuse(scrub_refusal(refusal, &mut text)),
+            Self::End(refusal) => Self::End(scrub_refusal(refusal, &mut text)),
+        }
+    }
+}
+
+/// Why an answer is not used, and the question that takes its place: see [`AnswerCheck::Refuse`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Refusal {
+    /// The new question the person reads: what was wrong, then the question.
+    pub question: String,
+    /// The interface of the new question ([`ToolError::NeedsInput::ui`]).
+    pub ui: Option<Value>,
+    /// The rule that failed, short and stable: journaled as `answer_refused`.
+    pub rule: String,
+    /// What the rule was about (a question's id), when it was about one thing.
+    pub subject: Option<String>,
+}
+
+impl Refusal {
+    /// A refusal that asks `question` again, under the interface `ui`, because of `rule`.
+    pub fn new(question: impl Into<String>, ui: Option<Value>, rule: impl Into<String>) -> Self {
+        Self {
+            question: question.into(),
+            ui,
+            rule: rule.into(),
+            subject: None,
+        }
+    }
+
+    /// Say what the rule was about.
+    #[must_use]
+    pub fn about(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
     }
 }
 
