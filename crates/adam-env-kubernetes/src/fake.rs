@@ -1113,6 +1113,91 @@ mod tests {
         );
     }
 
+    /// A reference of a run's workspace is mounted read-only in the run's pod, with its directory in
+    /// the mirror, and a repository slot beside it is not. A pod made before the reference was added is
+    /// made again for it.
+    #[tokio::test]
+    async fn a_reference_is_mounted_read_only_and_a_pod_is_made_again_when_one_is_added() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let app = ws.add_repository(&fx.remote("app")).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let before = fx.annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts");
+
+        let design = ws
+            .add_reference(&fx.remote("design"), "design")
+            .await
+            .unwrap();
+        assert!(!design.writable());
+        // The stale pod is deleted by the seal, and the next command makes it with the new slot.
+        fx.env.seal(&ws).await.unwrap();
+        assert!(fx.pod_names().is_empty(), "the stale pod is deleted");
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let after = fx.annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts");
+        assert_ne!(before, after, "the pod follows the new slot");
+
+        let mounts = fx.work_mounts(&pod_name(RUN));
+        let read_only = |path: &Path| {
+            mounts
+                .iter()
+                .find(|(mounted, _, _)| Path::new(mounted) == path)
+                .map(|(_, _, ro)| *ro)
+        };
+        let reference = design.reference().unwrap();
+        assert_eq!(read_only(design.path()), Some(true), "the reference");
+        assert_eq!(
+            read_only(reference.git_dir().unwrap()),
+            Some(true),
+            "its directory in the mirror, whole"
+        );
+        assert_eq!(read_only(app.path()), Some(false), "the repository's slot");
+        assert_eq!(
+            read_only(app.worktree().unwrap().git_dir().unwrap()),
+            Some(false),
+            "its own directory in the mirror stays writable"
+        );
+        assert!(
+            after
+                .unwrap()
+                .contains(&format!("ro {}", design.path().display())),
+            "the annotation says so"
+        );
+    }
+
+    /// A run that has a reference and no repository gets a pod (unlike a devcontainer, which has no
+    /// file to build from): the reference is mounted read-only and a command runs in it.
+    #[tokio::test]
+    async fn a_run_with_only_a_reference_gets_a_pod_and_runs_commands_in_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let design = ws
+            .add_reference(&fx.remote("design"), "design")
+            .await
+            .unwrap();
+        let session = fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let mounts = fx.work_mounts(&pod_name(RUN));
+        assert!(
+            mounts
+                .iter()
+                .any(|(path, _, ro)| Path::new(path) == design.path() && *ro),
+            "the reference is a read-only mount: {mounts:?}"
+        );
+        let prepared = session
+            .prepare(&ExecSpec::shell("cat README.md", design.path()))
+            .unwrap();
+        let args: Vec<String> = prepared
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|a| a.contains(&design.path().display().to_string())),
+            "the command runs in the reference's directory: {args:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_legacy_worktree_of_a_run_is_outside_its_directory_and_gets_no_mount() {
         let fx = fixture(settings());

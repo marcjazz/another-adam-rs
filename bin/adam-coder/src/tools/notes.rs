@@ -474,6 +474,46 @@ pub struct RunNotes {
     /// `read_skill_file` take only the names recorded here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repo_skills: BTreeMap<String, RepoSkillsNote>,
+    /// The references each prepared repository's own `.agents/references.json` declared, by slot,
+    /// with the id of the call that listed them. Written by `prepare_workspace` in the notes of the
+    /// **root** run, because a reference is read in the root's workspace. A call with the recorded
+    /// id lists them again from this record (a retry gives the same bytes); any other prepare of
+    /// the slot lists nothing. A declared reference is read only after the person agreed to it
+    /// (`request_repository` with `reference`), and only the address recorded here is ever fetched.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repo_references: BTreeMap<String, RepoReferencesNote>,
+    /// The commit each reference was first read at, by reference name: a reference made again (its
+    /// directory was lost) is checked out at this commit, never at where the branch is by then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reference_commits: BTreeMap<String, String>,
+}
+
+/// One reference a repository declared, as `prepare_workspace` listed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredReference {
+    /// The name the model reads it by (`repo: <name>`).
+    pub name: String,
+    /// The address the repository wrote. Never fetched before the person agreed.
+    pub url: String,
+    /// The branch it wrote, if it wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Its description as shown: scrubbed, on one line, cut.
+    pub description: String,
+}
+
+/// What `prepare_workspace` listed of the references a repository declared (see
+/// [`RunNotes::repo_references`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoReferencesNote {
+    /// The call that listed them.
+    pub call_id: String,
+    /// The references listed, in the file's order.
+    pub references: Vec<DeclaredReference>,
+    /// Each entry that was left out, and why, in one line.
+    pub skipped: Vec<String>,
+    /// How many entries came after the limit and were not looked at.
+    pub unexamined: usize,
 }
 
 /// One skill of a repository, as `prepare_workspace` listed it.
@@ -704,7 +744,12 @@ impl RunNotes {
     pub fn record_consents(&mut self, consents: impl IntoIterator<Item = Consent>) -> bool {
         let mut added = false;
         for consent in consents {
-            if consent.agreed && consent.tool == super::consent::REQUEST_REPOSITORY {
+            // A yes to reading a repository as a reference grants that and nothing else: it never
+            // names the repository, so `prepare_workspace` still refuses it.
+            if consent.agreed
+                && consent.tool == super::consent::REQUEST_REPOSITORY
+                && !super::consent::is_reference_subject(&consent.subject)
+            {
                 added |= self.name_repos([consent.subject.clone()]);
             }
             let known = self.consents.iter().any(|c| {
@@ -773,6 +818,17 @@ impl RunNotes {
             .rev()
             .find(|c| c.tool == tool && c.subject == subject)
             .is_some_and(|c| c.agreed)
+    }
+
+    /// The reference a prepared repository declared under `name`: the slot that declared it, and
+    /// the declaration. When two repositories declare one name, the first slot (by name) has it.
+    pub fn declared_reference(&self, name: &str) -> Option<(&str, &DeclaredReference)> {
+        self.repo_references.iter().find_map(|(slot, note)| {
+            note.references
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| (slot.as_str(), r))
+        })
     }
 
     /// Whether the person was asked about `subject` by `tool` and said no (and has not said yes
@@ -1397,5 +1453,28 @@ mod tests {
         assert!(store.load("../etc/passwd").await.is_err());
         assert!(store.save("a/b", &RunNotes::default()).await.is_err());
         assert!(store.load("").await.is_err());
+    }
+
+    #[test]
+    fn a_yes_to_reading_a_reference_is_recorded_and_names_no_repository() {
+        let consent = |tool: &str, subject: &str| Consent {
+            call_id: "q1".to_owned(),
+            tool: tool.to_owned(),
+            subject: subject.to_owned(),
+            agreed: true,
+        };
+        let mut notes = RunNotes::default();
+        assert!(notes.record_consents([consent(
+            "request_repository",
+            "reference:github.com/acme/lib@dev"
+        )]));
+        assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
+        assert!(notes.agreed("request_repository", "reference:github.com/acme/lib@dev"));
+        // The same words for another branch, or for the repository as a repository, are others.
+        assert!(!notes.agreed("request_repository", "reference:github.com/acme/lib"));
+        assert!(!notes.agreed("request_repository", "github.com/acme/lib"));
+        // A yes to adding a repository names it.
+        notes.record_consents([consent("request_repository", "github.com/acme/lib")]);
+        assert_eq!(notes.named_repos, ["github.com/acme/lib"]);
     }
 }

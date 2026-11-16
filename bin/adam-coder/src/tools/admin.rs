@@ -67,7 +67,7 @@ use super::create::{valid_name, valid_owner};
 use super::named::{default_host_key, key_of_argument, split_key};
 use super::notes::{RenamedRepo, RunNotes};
 use super::prepare::not_named;
-use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, resolve_slot};
+use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, references, resolve_slot};
 
 /// The tool's name.
 pub const MERGE_PULL_REQUEST: &str = "merge_pull_request";
@@ -127,8 +127,10 @@ async fn target(
         && let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string())
         && let Ok(slots) = workspace.slots().await
         && let Ok(slot) = resolve_slot(slots, non_empty(repo), host)
-        && let Some(wt) = slot.worktree()
+        && let Some(wt) = slot.checkout()
     {
+        // A reference's slot gives the repository's own address, never its name read as a
+        // repository's: the guard below judges that address.
         address = Some(wt.repo().url.clone());
     }
     let Some(address) = address.or_else(|| address_of(repo, host)) else {
@@ -143,6 +145,15 @@ async fn target(
             "{repo:?} is not a repository address"
         )));
     };
+    // A reference is read and never changed: not merged into, renamed or deleted. A repository the
+    // person named is theirs to change, whatever else reads it.
+    let slots = match env.workspaces.run(&ctx.root_run_id().to_string()) {
+        Ok(workspace) => workspace.slots().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if references::is_reference_key(env, &slots, &key) && !notes.named_repos.contains(&key) {
+        return Err(ToolOutput::error(references::refusal_by_address(&address)));
+    }
     if let Err(e) = env.workspaces.check_repository(&at) {
         return Err(ToolOutput::error(format!(
             "{address} cannot be used here: {e}"

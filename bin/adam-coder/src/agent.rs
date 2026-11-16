@@ -25,7 +25,7 @@ use crate::tier;
 use crate::tools::admin::MERGE_PULL_REQUEST;
 use crate::tools::consent::{
     Answer, Surface, answer_of, asked_by, is_answered_by_the_person, is_consent_tool,
-    is_tools_own_result, merge_answer, surface_of_answer,
+    is_reference_question, is_tools_own_result, merge_answer, surface_of_answer,
 };
 use crate::tools::named::{key_of_argument, listed, without_untrusted};
 use crate::tools::notes::{Consent, Heard, PushedBranch, RunNotes, When};
@@ -306,7 +306,15 @@ impl CoderAgent {
         };
         let bound = def
             .var("max_check_cycles", env.settings.max_check_cycles)
-            .bind(tools.into_iter().collect::<ToolSet>())?
+            .bind(tools.into_iter().collect::<ToolSet>())?;
+        // The references the agent and the deployment declare: static for the process, so their
+        // names and descriptions are the same words on every turn, before any source whose words
+        // change with a message. With none this adds nothing and the prompt is what it was.
+        let bound = match env.references.source() {
+            Some(references) => bound.tool_source(references),
+            None => bound,
+        };
+        let bound = bound
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
             // The access tier of the message: tools above it are not shown and not run.
@@ -869,7 +877,9 @@ impl<'a> Answers<'a> {
 /// messages that follow an assistant message and are the result of an `ask_user` call of that
 /// very message count, and so do those of a `request_repository` call that did not fail (what the
 /// person said to the question the tool wrote; an error result is the tool's own words, and it may
-/// quote the address the model chose). Assistant text and every other tool's result never do.
+/// quote the address the model chose), **except** the answer to a question about reading a reference:
+/// a yes to reading names no repository to work on, in words as much as in a form. Assistant text and
+/// every other tool's result never count.
 fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
     let mut said = Vec::new();
     let mut answers = Answers::new();
@@ -898,6 +908,7 @@ fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
                 // its own words, the values it chose included), not the tool's own result.
                 if let Some(call) = answers.next()
                     && is_answered_by_the_person(&call.name)
+                    && !is_reference_question(call)
                     && !*is_error
                     && !is_tools_own_result(&call.name, &message.text())
                 {
@@ -928,10 +939,13 @@ fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
             continue;
         };
         let text = without_untrusted(&text);
+        let answering = question.take();
+        // The answer to a question about reading a reference names no repository (see the loop above).
+        if answering.is_some_and(is_reference_question) {
+            continue;
+        }
         said.push(Heard {
-            defaults: question
-                .take()
-                .and_then(|call| defaults_of_answer(call, &text)),
+            defaults: answering.and_then(|call| defaults_of_answer(call, &text)),
             text,
             when: When::Waiting,
         });
@@ -1023,7 +1037,7 @@ fn consents_in(
         {
             return None;
         }
-        let asked = asked_by(&call.name, &call.arguments)?;
+        let asked = asked_by(&call.name, &call.arguments, notes)?;
         let agreed = match answer_of(&answer, &asked.yes) {
             Answer::Yes => true,
             Answer::No => false,
@@ -1273,8 +1287,15 @@ impl Agent for CoderAgent {
                     },
                     None if notes.pull_request.is_some() => Transition::Done { state, output },
                     None => {
+                        // The slots the run works in: a reference is read, so a run that only read
+                        // one has no work to deliver, and a scratch project beside one is still the
+                        // only thing the run made.
                         let slots = match self.env.workspaces.run(&run) {
-                            Ok(workspace) => workspace.slots().await.unwrap_or_default(),
+                            Ok(workspace) => {
+                                let mut slots = workspace.slots().await.unwrap_or_default();
+                                slots.retain(adam_workspace::Slot::writable);
+                                slots
+                            }
                             Err(_) => Vec::new(),
                         };
                         let scratch_only =
@@ -1760,6 +1781,50 @@ mod tests {
         // The same words with nothing to pair with are not trusted either.
         let loose = conversation(vec![Message::user_text(untouched("ask-c1"))]);
         assert!(named_by(&person_sayings(&loose, &[])).is_empty());
+    }
+
+    /// The answer to a question about reading a reference names no repository, in the history and in
+    /// the inbox of a run parked on it, while the same words answering a question about adding one
+    /// do (`Yes, read acme/lib` holds the address as `Yes, add acme/lib` does).
+    #[test]
+    fn the_answer_to_a_question_about_reading_a_reference_names_no_repository() {
+        let ask = |reference: Option<&str>| {
+            let mut arguments = json!({"repo_url": "https://github.com/acme/lib", "reason": "r"});
+            if let Some(name) = reference {
+                arguments["reference"] = json!(name);
+            }
+            ToolCall {
+                id: "c1".into(),
+                name: "request_repository".into(),
+                arguments,
+                ..Default::default()
+            }
+        };
+        let words = "Yes, read acme/lib";
+        let lib = ["github.com/acme/lib".to_owned()];
+        for (reference, named) in [(Some("lib"), false), (None, true)] {
+            let history = conversation(vec![
+                Message::user_text("look around"),
+                assistant("", vec![ask(reference)]),
+                Message::tool_result("c1", words),
+            ]);
+            let heard = named_by(&person_sayings(&history, &[]));
+            assert_eq!(
+                heard == lib,
+                named,
+                "{reference:?} in the history: {heard:?}"
+            );
+            let inbox = [Inbound::new("message", json!({ "text": words }))];
+            let heard = named_by(&person_sayings(&parked_on_call(&ask(reference)), &inbox));
+            assert_eq!(heard == lib, named, "{reference:?} in the inbox: {heard:?}");
+        }
+        // Only the answer is left out: what the person typed after it still counts.
+        let inbox = [
+            Inbound::new("message", json!({ "text": words })),
+            Inbound::new("message", json!({ "text": "and look at acme/other" })),
+        ];
+        let heard = named_by(&person_sayings(&parked_on_call(&ask(Some("lib"))), &inbox));
+        assert_eq!(heard, ["github.com/acme/other"]);
     }
 
     /// A form the model drew earlier is still on the screen when a later call waits: its answer

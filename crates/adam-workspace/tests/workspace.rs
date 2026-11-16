@@ -4841,3 +4841,291 @@ async fn a_scratch_project_taken_over_by_another_run_has_a_generation_of_its_own
             .is_some()
     );
 }
+
+// ------------------------------------------------------------------------------------- references
+
+#[tokio::test]
+async fn a_reference_is_a_detached_checkout_with_no_branch_of_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, design) = remote_with(
+        tmp.path(),
+        "acme",
+        "design",
+        &[("tokens.css", "--blue: #00f;\n")],
+    );
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_reference(&design, "design-system").await.unwrap();
+
+    assert_eq!(slot.dir(), "design-system", "the name it was given");
+    assert!(!slot.writable(), "the one gate says no");
+    assert!(matches!(slot.kind(), SlotKind::Reference(_)));
+    assert!(slot.worktree().is_none(), "it is not a repository slot");
+    assert!(slot.scratch().is_none());
+    let wt = slot.reference().expect("the checkout");
+    assert!(wt.is_reference());
+    assert_eq!(slot.checkout().unwrap().path(), wt.path());
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("tokens.css")).unwrap(),
+        "--blue: #00f;\n"
+    );
+
+    // Detached at the base: no branch is checked out and none was made for it.
+    let head = Command::new("git")
+        .current_dir(wt.path())
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!head.status.success(), "HEAD is detached");
+    assert_eq!(
+        git(wt.path(), &["rev-parse", "HEAD"]),
+        git(&remote, &["rev-parse", "main"])
+    );
+    let mirror = wt.mirror();
+    assert!(
+        git(mirror, &["for-each-ref", "refs/heads"]).is_empty(),
+        "the mirror has no local branch because of a reference"
+    );
+    let meta = std::fs::read_to_string(
+        tmp.path()
+            .join("root/meta")
+            .join(RUN)
+            .join("design-system.json"),
+    )
+    .unwrap();
+    assert!(meta.contains("\"kind\": \"reference\""), "{meta}");
+    assert!(!meta.contains(TOKEN), "no credentials in the metadata");
+
+    // Listed, found by its name, and not the run's repository.
+    assert_eq!(run.slots().await.unwrap().len(), 1);
+    let found = run.slot("design-system").await.unwrap().unwrap();
+    assert!(found.reference().is_some() && !found.writable());
+    assert!(run.slot_for(&design).await.unwrap().is_none());
+
+    // Idempotent: asking again returns the slot as it is, not moved to a newer commit.
+    let before = git(wt.path(), &["rev-parse", "HEAD"]);
+    let seed = tmp.path().join("seed-acme-design");
+    std::fs::write(seed.join("more.css"), "x\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "--quiet", "-m", "later"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    let again = run.add_reference(&design, "design-system").await.unwrap();
+    assert_eq!(again.seq(), slot.seq());
+    assert_eq!(git(again.path(), &["rev-parse", "HEAD"]), before);
+
+    // It survives a restart of the process, still a reference.
+    let restarted = workspaces(tmp.path());
+    let after = restarted.run(RUN).unwrap().slots().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].reference().is_some() && !after[0].writable());
+}
+
+#[tokio::test]
+async fn nothing_is_written_through_a_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "a\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_reference(&design, "design").await.unwrap();
+    let wt = slot.reference().unwrap().clone();
+    let refs_before = remote_refs_of(&remote);
+    let head_before = git(wt.path(), &["rev-parse", "HEAD"]);
+    // Something that a commit would pick up.
+    std::fs::write(wt.path().join("a.txt"), "changed\n").unwrap();
+
+    let refused = |e: WorkspaceError| {
+        assert!(matches!(e, WorkspaceError::Invalid(_)), "{e}");
+        let said = e.to_string();
+        assert!(said.contains("is a reference"), "{said}");
+    };
+    refused(wt.commit_all("work", &me()).await.unwrap_err());
+    refused(wt.push().await.unwrap_err());
+    refused(wt.publish().await.unwrap_err());
+    refused(wt.add_base_checkout().await.unwrap_err());
+
+    let scratch = run
+        .add_scratch("proj", &me())
+        .await
+        .unwrap()
+        .scratch()
+        .unwrap()
+        .clone();
+    put(scratch.root().path(), "new.txt", "new\n");
+    refused(
+        copy_into(&scratch, &wt, "", false)
+            .await
+            .expect_err("a reference is no destination"),
+    );
+    assert!(
+        !wt.path().join("new.txt").exists(),
+        "nothing was copied into it"
+    );
+
+    assert_eq!(git(wt.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        remote_refs_of(&remote),
+        refs_before,
+        "nothing reached the remote"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("a.txt")).unwrap(),
+        "changed\n",
+        "what is there is untouched by the refusals"
+    );
+}
+
+#[tokio::test]
+async fn a_reference_cannot_take_a_name_or_a_repository_the_run_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, app) = remote_with(tmp.path(), "acme", "app", &[("app.txt", "app\n")]);
+    let (_, lib) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    run.add_repository(&app).await.unwrap();
+
+    // The repository the run works on is read in its own slot.
+    let same = run.add_reference(&app, "app-again").await.unwrap_err();
+    assert!(matches!(same, WorkspaceError::Conflict(_)), "{same}");
+    // A name another slot has, and names that are not slot names.
+    let taken = run.add_reference(&lib, "app").await.unwrap_err();
+    assert!(matches!(taken, WorkspaceError::Conflict(_)), "{taken}");
+    for bad in ["", "Up", "a/b", "..", ".hidden", "x.git"] {
+        let e = run.add_reference(&lib, bad).await.unwrap_err();
+        assert!(matches!(e, WorkspaceError::Invalid(_)), "{bad:?}: {e}");
+    }
+    assert_eq!(run.slots().await.unwrap().len(), 1, "nothing was made");
+
+    // The same name for another repository is a conflict too.
+    run.add_reference(&lib, "docs").await.unwrap();
+    let (_, other) = remote_with(tmp.path(), "acme", "other", &[("o.txt", "o\n")]);
+    let e = run.add_reference(&other, "docs").await.unwrap_err();
+    assert!(matches!(e, WorkspaceError::Conflict(_)), "{e}");
+
+    // A repository added later, whose own name a reference has, gets a slot of its own: writable.
+    let (_, docs) = remote_with(tmp.path(), "acme", "docs", &[("d.txt", "d\n")]);
+    let added = run.add_repository(&docs).await.unwrap();
+    assert!(added.writable() && added.worktree().is_some());
+    assert_ne!(added.dir(), "docs", "the reference keeps its name");
+}
+
+#[tokio::test]
+async fn removing_the_workspace_removes_its_references() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "a\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_reference(&design, "design").await.unwrap();
+    let mirror = slot.reference().unwrap().mirror().to_owned();
+    let path = slot.path().to_owned();
+    assert!(
+        std::fs::read_dir(mirror.join("worktrees")).unwrap().count() == 1,
+        "the checkout is a linked worktree of the mirror"
+    );
+    run.remove().await.unwrap();
+    assert!(!path.exists());
+    assert!(run.slots().await.unwrap().is_empty());
+    assert!(
+        std::fs::read_dir(mirror.join("worktrees")).map_or(true, |d| d.count() == 0),
+        "its directory in the mirror went with it"
+    );
+    run.remove().await.unwrap();
+}
+
+/// The metadata of a reference has a version a binary that does not know references refuses, so a
+/// rolling deploy or a rollback never reads it as a repository slot that can be written. A
+/// repository slot's and a scratch project's keep theirs.
+#[tokio::test]
+async fn a_reference_has_its_own_metadata_version_and_a_repository_slot_keeps_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "a\n")]);
+    let (_, app) = remote_with(tmp.path(), "acme", "app", &[("b.txt", "b\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    run.add_reference(&design, "design").await.unwrap();
+    run.add_repository(&app).await.unwrap();
+    run.add_scratch("notes", &me()).await.unwrap();
+    let meta_dir = tmp.path().join("root/meta").join(RUN);
+    let version_of = |name: &str| -> u64 {
+        let text = std::fs::read_to_string(meta_dir.join(format!("{name}.json"))).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["version"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(version_of("design"), 3, "a reference");
+    assert_eq!(version_of("app"), 2, "a repository slot: as it always was");
+    assert_eq!(
+        version_of("notes"),
+        2,
+        "a scratch project: as it always was"
+    );
+    assert_eq!(run.slots().await.unwrap().len(), 3);
+
+    // The reader holds a reference to its version: the shape of a repository slot's file, at the
+    // version a repository has, is not read as a reference, and not as anything.
+    let path = meta_dir.join("design.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    meta["version"] = serde_json::json!(2);
+    std::fs::write(&path, meta.to_string()).unwrap();
+    let again = workspaces(tmp.path());
+    let e = again.run(RUN).unwrap().slots().await.unwrap_err();
+    assert!(matches!(e, WorkspaceError::Corrupt(_)), "{e}");
+}
+
+/// A reference made again comes back at the commit it was first read at, not at where the branch is
+/// now; a commit that is gone is said and nothing is moved to another.
+#[tokio::test]
+async fn a_reference_made_again_comes_back_at_the_commit_it_was_read_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "first\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_reference(&design, "design").await.unwrap();
+    let read_at = slot.reference().unwrap().head_commit().await.unwrap();
+    assert_eq!(read_at, git(&remote, &["rev-parse", "main"]));
+    assert_eq!(read_at.len(), 40);
+
+    // The branch moves on and the directory is lost.
+    let seed = tmp.path().join("seed-acme-design");
+    std::fs::write(seed.join("a.txt"), "second\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "--quiet", "-m", "later"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    assert_ne!(git(&remote, &["rev-parse", "main"]), read_at);
+    std::fs::remove_dir_all(slot.path()).unwrap();
+
+    // Without the commit, the branch's tip; with it, the commit.
+    let back = run
+        .add_reference_at(&design, "design", Some(&read_at))
+        .await
+        .unwrap();
+    assert_eq!(
+        back.reference().unwrap().head_commit().await.unwrap(),
+        read_at
+    );
+    assert_eq!(
+        std::fs::read_to_string(back.path().join("a.txt")).unwrap(),
+        "first\n",
+        "the file as it was when it was read"
+    );
+
+    // A commit the repository does not have: an error that says so, and no slot made.
+    let (_, lib) = remote_with(tmp.path(), "acme", "lib", &[("l.txt", "l\n")]);
+    for gone in ["1".repeat(40), "--output=/tmp/x".to_owned()] {
+        let e = run
+            .add_reference_at(&lib, "lib", Some(&gone))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, WorkspaceError::NotFound(_)), "{e}");
+        assert!(e.to_string().contains("nothing was moved"), "{e}");
+    }
+    assert_eq!(run.slots().await.unwrap().len(), 1, "no slot for `lib`");
+    assert!(
+        !tmp.path()
+            .join("root/meta")
+            .join(RUN)
+            .join("lib.json")
+            .exists()
+    );
+}

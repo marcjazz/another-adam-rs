@@ -95,7 +95,7 @@ pub async fn share_file(
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -131,7 +131,9 @@ pub async fn share_file(
     // person never gets it, so it delivers nothing for the root.
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    if notes.record_shared(&format!("{}/{}", slot.dir(), path)) {
+    // Only what is shared from a slot the run works in is a result of its own: a file of a reference
+    // is somebody else's, however it reaches the person.
+    if slot.writable() && notes.record_shared(&format!("{}/{}", slot.dir(), path)) {
         env.notes
             .save(&run, &notes)
             .await
