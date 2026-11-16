@@ -202,6 +202,9 @@ run that is `runnable` or `parked` keeps its workspace however long the person t
 that does not answer leaves it alone. For a finished run whose conversation is alive (a task open, or the newest one
 within `SCRATCH_IDLE_DAYS`) it removes everything but the scratch projects.
 
+The janitor also stops the commands that keep running of a run that is over, **before** it releases the environment
+([Commands that keep running](coder-agent.md#commands-that-keep-running)).
+
 ## Environments: where a run's processes run
 
 The project's checks, a command to look around and a command that makes something are started through the `Environment` port.
@@ -261,6 +264,37 @@ stateDiagram-v2
     Released --> [*]
 ```
 
+### Commands that keep running, by placement
+
+`start_command` ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
+decision 13) starts a process that outlives the call, in the same environment as `run`, with `ExecSpec::background`. The coder holds
+the process it spawned (its `Child`), and the environment holds what it started elsewhere. A run moves between workers at every
+step, so a command is **one worker's** (its owner, which writes a beat into the command's record at start and at every sweep) and
+the others see it through the record: [Several workers](coder-agent.md#several-workers).
+
+| Placement | The process | Id | Stopped by | After the coder restarts |
+|---|---|---|---|---|
+| local | `sh -lc` in its own process group, a child of the coder | `bg-local-<n>` | the group is killed (`kill_group`), and what the leader left in the group, whatever ended the leader | it dies with the container (`tini`); a coder outside a container finds the record, and kills the pid only when its start time still matches, and what is left of its group (Linux); a registry that is dropped kills the groups it holds; the janitor kills what the records of a finished run name before it removes them |
+| run pod | `adam-exec shell` in the pod; the `adam-kube-exec` client is the coder's child | `bg-kp-<epoch>-<n>` | the client is killed, then `adam-exec kill <id>` in the pod, when the client ends by itself too (`cmd &` outlives the client); another worker's `stop_command` kills the exec id at once and asks the owner to settle it | the pod's process may live on: once the record's beat is stale (the larger of three sweeps and 60 s) the next `start_command`, `stop_command` or `list_commands` kills it by exec id, and says `gone`; the janitor's `release` deletes the pod anyway |
+| devcontainer | the same, through `devcontainer exec` | `bg-dc-<epoch>-<n>` | as for a pod | as for a pod; `release` removes the container |
+
+* **A pod made again** (a new slot, a reference, a rebuild) ends the client of a command in it. The coder cannot tell why the client
+  ended, so a command in a pod or a devcontainer that a signal ended, and that nobody asked to stop, is `stopped` with the reason
+  *its environment was made again ... or something outside ended it; start it again if it is still needed*. `rebuild_environment` stops
+  the run's commands first and says so.
+* **`adam-exec active-fg`** counts the live records whose id does not start with `bg-`. A pod made again for a new slot asks
+  `active-fg` (`free_for_new_mount`, `seal`), so a development server never holds the pod from a new repository: the pod is
+  deleted with the server in it, and the client of the command ends. The idle sweep asks `active`, which counts every command,
+  so a pod with a server in it is never idle. A pod whose `adam-exec` has no `active-fg` (an older image) answers its usage line, and
+  the pod is asked `active` instead, as before: every command holds it, a background one too (it fails safe). A newer `adam-exec`
+  with an older coder is harmless: nothing asks `active-fg`, and an older coder starts no background command.
+* **Ports.** In a pod a port is reachable from the run's other commands on `localhost` and not through the egress proxy
+  (`NO_PROXY` has `localhost`), and by nothing outside the pod: the pod's ingress is empty and no port is published. In the
+  coder's own container all runs of the worker share one network, so ports collide and runs reach each other's ports: the local
+  mode's known limit.
+* A process that leaves its process group and its parent (`setsid` and a double fork) escapes `adam-exec kill`. In a pod the
+  pod's deletion is the backstop; locally there is none.
+
 ### A pod for each run
 
 A build is bounded by the pod's memory (2Gi in the chart), and the coder shrinks to about 1Gi
@@ -271,7 +305,8 @@ each worktree its mirror read-only and the worktree's own directory in it (with 
 top), each at the same path as in the coder, so a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)).
 A reference is mounted **read-only** (`ro <path>` in the pod's mounts annotation), and so is its directory in the
 mirror, whole: a write from the pod is `EROFS`. A repository added to a
-run later, or a slot made again under the same name, makes the pod again, when no command runs in it. A command is
+run later, or a slot made again under the same name, makes the pod again, when no command runs in it (a command that keeps
+running does not count: it ends with the pod). A command is
 `adam-kube-exec`, which runs `adam-exec` in the pod over `pods/exec`. No GitHub credential ever enters a
 pod. The chart's `runPods` block renders what surrounds it
 ([deploy guide](../guides/deploy-the-coder.md#run-pods)).

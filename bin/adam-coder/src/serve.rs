@@ -39,6 +39,7 @@ use crate::github_mcp::{GitHubReadBearer, SERVER_NAME as GITHUB_SERVER};
 use crate::janitor::Janitor;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
+use crate::tools::CommandsSweep;
 use crate::{
     AGENT_NAME, AgentFiles, CoderAgent, CoderSettings, Config, RunEnvironment, RunPodsConfig,
     ToolEnv, WorkerConfig, agent_card_for, coder_tools,
@@ -54,7 +55,7 @@ async fn build_agent(
     max_access_tier: AccessTier,
     redactor: Redactor,
     files: &AgentFiles,
-) -> anyhow::Result<(CoderAgent, Janitor)> {
+) -> anyhow::Result<(CoderAgent, Janitor, CommandsSweep)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
         tracing::warn!(
@@ -104,6 +105,9 @@ async fn build_agent(
     settings.check_timeout = worker.check_timeout;
     settings.environment_start = worker.run_environment.start_bound(&worker.devcontainer);
     settings.check_output_tail = worker.check_output_tail;
+    settings.background_commands_max = worker.background_commands_max;
+    settings.background_command_max = worker.background_command_max;
+    settings.background_sweep = worker.background_sweep;
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
@@ -210,10 +214,25 @@ async fn build_agent(
     let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep)
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);
+    let (janitor, sweep) = wire_commands(&env, janitor, worker);
     let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
         .map_err(|e| *e)
         .context("assembling the coder agent")?;
-    Ok((agent, janitor))
+    Ok((agent, janitor, sweep))
+}
+
+/// Make the commands that keep running of `env` the janitor's too (it stops them before it releases
+/// what holds them) and the sweep's (every `BACKGROUND_SWEEP_SECS`): one registry for the tools, the
+/// janitor and the sweep.
+pub fn wire_commands(
+    env: &ToolEnv,
+    janitor: Janitor,
+    worker: &WorkerConfig,
+) -> (Janitor, CommandsSweep) {
+    (
+        janitor.with_commands(env.commands.clone()),
+        CommandsSweep::new(&env.commands, worker.background_sweep),
+    )
 }
 
 /// Where this worker's runs run their commands: the repository's devcontainer, on the
@@ -385,7 +404,7 @@ pub async fn serve(
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
     let (agents, prompts) = match &config.worker {
         Some(worker) => {
-            let (agent, janitor) = build_agent(
+            let (agent, janitor, sweep) = build_agent(
                 worker,
                 config.max_access_tier,
                 Redactor::from_config(&config),
@@ -399,7 +418,9 @@ pub async fn serve(
                 Agents::new(AGENT_NAME, move |builder| agent.register(builder))
                     .options(options_of(worker))
                     // Beside the runtime's worker: the sweep of the workspaces of finished runs.
-                    .worker_component("janitor", move |store, stop| janitor.run(store, stop)),
+                    .worker_component("janitor", move |store, stop| janitor.run(store, stop))
+                    // The commands that keep running: stopped with their run, whatever ended it.
+                    .worker_component("commands", move |store, stop| sweep.run(store, stop)),
                 prompts,
             )
         }
