@@ -312,13 +312,66 @@ async fn the_prefix_holds_across_prepare_and_nested_reads() {
     assert_eq!(notes.instructions_shown["remote/sub/deep"], "c3");
 }
 
-/// A coder whose history budget is `max_history_tokens` (the shipped files with one line changed).
+/// A model that refuses the summary request of a compaction: the history is then shortened, as the
+/// tests that were written before compaction existed expect (`coder_with_history`). Those that want a
+/// summary use `coder_with_history_and_summaries`.
+struct NoSummaries(Arc<MockModel>);
+
+fn is_summary(request: &ModelRequest) -> bool {
+    request.tool_choice == adam_model::ToolChoice::None
+        && request
+            .messages
+            .last()
+            .is_some_and(|m| m.text().ends_with(adam_llm_agent::COMPACTION_TURN))
+}
+
+#[async_trait]
+impl ModelClient for NoSummaries {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        if is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
+        self.0.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        if is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
+        self.0.stream(req).await
+    }
+}
+
+/// A coder whose history budget is `max_history_tokens` (the shipped files with one line changed),
+/// and whose model makes no summary: a history over the budget is shortened.
 fn coder_with_history(
     fx: &Fixture,
     mock: &Arc<MockModel>,
     store: DynStore,
     max_history_tokens: u32,
 ) -> Coder {
+    history_coder(
+        fx,
+        Arc::new(NoSummaries(mock.clone())),
+        store,
+        max_history_tokens,
+    )
+}
+
+/// The same, with a model that summarises: the scripted responses include the summary.
+fn coder_with_history_and_summaries(
+    fx: &Fixture,
+    mock: &Arc<MockModel>,
+    store: DynStore,
+    max_history_tokens: u32,
+) -> Coder {
+    history_coder(fx, mock.clone(), store, max_history_tokens)
+}
+
+fn history_coder(fx: &Fixture, model: DynModel, store: DynStore, max_history_tokens: u32) -> Coder {
     let folder = common::plain_folder();
     common::edit_instructions(&folder, |text| {
         assert!(text.contains("max_history_tokens: 100000"));
@@ -328,7 +381,6 @@ fn coder_with_history(
         )
     });
     let files = adam_coder::AgentFiles::load(Some(folder.path())).expect("the folder loads");
-    let model: DynModel = mock.clone();
     let def = files
         .def()
         .expect("a definition")
@@ -893,4 +945,79 @@ async fn a_loaded_repository_skill_replays_from_the_journal_after_the_file_chang
     assert!(!c2.contains("EDITED"), "{c2}");
     let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
     assert_eq!(notes.repo_skills["remote"].call_id, "c1");
+}
+
+/// A long run is compacted (two reads of a 31 KB file fill a budget of 31,000 tokens, of which the
+/// coder's instructions and tools take about 18,000): the result of
+/// `prepare_workspace` (the slot, the branch, the listing of the repository's skills and its
+/// instructions) is pinned, so the marker that replaces the turns it was in still holds it, as the
+/// repository's text and not as a message of the person.
+#[tokio::test]
+async fn the_prepare_result_survives_a_compaction() {
+    let fx = Fixture::new().await;
+    repository_with_a_skill(&fx);
+    let notes: String = (0..500)
+        .map(|n| format!("note {n:04}: {}\n", "w".repeat(50)))
+        .collect();
+    fx.commit_to_main("notes.txt", &notes);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![prepare("c1", &fx)])
+        .push_tool_calls(vec![read("c2", "notes.txt")])
+        .push_tool_calls(vec![read("c3", "notes.txt")])
+        .push_text("SUMMARY: prepared the workspace and read the notes")
+        .push_text("done");
+    // The budget is over what the request holds at least after the cut (the instructions and the
+    // tools, the task and the newest read: a compaction that left the request over it would not be
+    // made) and under what it holds after the second read, each by about 4,000 tokens.
+    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 31_000);
+    let task_text = format!("look at {}", fx.remote_url());
+    let (_, run) = submit(&coder, &task_text).await;
+    let worker = spawn_worker(&coder);
+    let view = settled(&coder, run).await;
+    worker.stop().await;
+    assert_ne!(view.status, RunStatus::Failed, "{view:#?}");
+
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "three turns, the summary and the last turn"
+    );
+    let after = &requests[4];
+    // Whoever reads what the person said sees the task and nothing else: the marker is the second
+    // part of the first message and holds the repository's text.
+    let Message::User { content } = &after.messages[0] else {
+        panic!("the first message is the person's");
+    };
+    assert_eq!(content[0].as_text(), task_text);
+    let marker = content[1].as_text();
+    assert!(
+        marker.starts_with(adam_llm_agent::OMITTED_MARKER_PREFIX),
+        "{marker}"
+    );
+    assert!(
+        marker.contains("SUMMARY: prepared the workspace"),
+        "{marker}"
+    );
+    assert!(marker.contains("Kept earlier results"), "{marker}");
+    assert!(
+        marker.contains("Skills in this repository (slot `remote`)"),
+        "{marker}"
+    );
+    assert!(
+        marker.contains("remote/release-notes: Drafts release notes."),
+        "{marker}"
+    );
+    assert!(marker.contains("root rules"), "{marker}");
+    assert!(
+        marker.contains("agent/"),
+        "the branch of the checkout: {marker}"
+    );
+    assert_eq!(
+        content.len(),
+        2,
+        "no other part: the person said nothing else"
+    );
+    // The cache's head did not move.
+    assert_eq!(head(&requests[2]), head(&requests[4]));
 }
