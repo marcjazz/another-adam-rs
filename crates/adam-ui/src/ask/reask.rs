@@ -13,13 +13,14 @@ use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
 use super::answer::{Check, FormSpec, Rule, Verdict, check_answer, whole};
+use super::shown;
 use super::{
     Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
 };
 use crate::surface::{ask_attempt, ask_retry_surface_id};
 
 /// The longest words of a question quoted back to the person.
-const QUOTED_QUESTION: usize = 80;
+pub(super) const QUOTED_QUESTION: usize = 80;
 
 /// How many times a form is asked again after an answer that does not fit. The next bad answer ends
 /// the question: the model is told, as an error, and may ask another way.
@@ -220,8 +221,8 @@ impl Drawn {
     }
 }
 
-/// The `Choices` component of the interface: the component with the id `root` of its
-/// `updateComponents` message.
+/// The `Choices` component of the interface: the root of a form with nothing above it, or the
+/// form inside the `Column` that holds what a question shows.
 fn root_of(ui: &Value) -> Option<&Value> {
     ui.as_array()?.iter().find_map(|message| {
         message
@@ -229,7 +230,7 @@ fn root_of(ui: &Value) -> Option<&Value> {
             .get("components")?
             .as_array()?
             .iter()
-            .find(|c| c.get("id").and_then(Value::as_str) == Some("root"))
+            .find(|c| c.get("component").and_then(Value::as_str) == Some("Choices"))
     })
 }
 
@@ -240,7 +241,7 @@ fn root_of_mut(ui: &mut Value) -> Option<&mut Value> {
             .get_mut("components")?
             .as_array_mut()?
             .iter_mut()
-            .find(|c| c.get("id").and_then(Value::as_str) == Some("root"))
+            .find(|c| c.get("component").and_then(Value::as_str) == Some("Choices"))
     })
 }
 
@@ -311,17 +312,49 @@ fn ask_again(
     } else {
         question.to_owned()
     };
+    // What the form shows and the screen could not draw is still said, in the same words.
+    let lead = format!("{lead}{}", shown::undrawn_words(form, ui));
     let attempt = surface_of(ui)
         .and_then(|surface| ask_attempt(&surface))
         .map_or(1, |n| n + 1);
     let surface = ask_retry_surface_id(call_id, attempt);
     set_surface(&mut asked, &surface);
     carry_answers(&mut asked, drawn, context, &verdict.valid);
-    let refusal = Refusal::new(format!("{said}\n{lead}"), Some(asked), rule);
+    let asked = fits(&mut asked, form).then_some(asked);
+    let refusal = Refusal::new(format!("{said}\n{lead}"), asked, rule);
     match &verdict.question {
         Some(id) => refusal.about(id.clone()),
         None => refusal,
     }
+}
+
+/// The surface asked again is no larger than a screen reads, which the defaults carried may have
+/// pushed it over: the defaults are dropped, the texts first, until it fits. `false` when it does not
+/// fit with none (the form is then asked in words). A form that shows nothing is left as it is.
+fn fits(asked: &mut Value, form: &Form) -> bool {
+    if form.questions.iter().all(|q| q.shown.is_empty()) {
+        return true;
+    }
+    for texts in [true, false] {
+        while shown::check_size(asked).is_err() {
+            let carried = root_of_mut(asked)
+                .and_then(|root| root.get_mut("questions")?.as_array_mut())
+                .and_then(|questions| {
+                    questions.iter_mut().find(|q| {
+                        let text = matches!(
+                            q.get("type").and_then(Value::as_str),
+                            Some("text" | "longText")
+                        );
+                        q.get("default").is_some() && text == texts
+                    })
+                });
+            let Some(Value::Object(question)) = carried else {
+                break;
+            };
+            question.remove("default");
+        }
+    }
+    shown::check_size(asked).is_ok()
 }
 
 /// The id of the surface the interface creates.
