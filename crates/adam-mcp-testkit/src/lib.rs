@@ -18,6 +18,9 @@
 //! | `slow` | none | nothing, ever |
 //! | `a.b` | none | `dotted`; a tool whose name no model provider accepts |
 //!
+//! A [`Script`] adds what a server says about itself (`instructions`) and the prompts it serves
+//! ([`TestPrompt`]); [`TestHttpServer::start_scripted`] serves one.
+//!
 //! Test code, not a product: it panics and exits on purpose.
 
 #![warn(missing_docs)]
@@ -31,9 +34,10 @@ use base64::Engine as _;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, Resource, ResourceContents,
-    ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
+    PromptMessage, Resource, ResourceContents, Role, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -59,18 +63,115 @@ pub struct Counters {
     pub initializations: AtomicUsize,
     /// Tool calls that reached the handler (whether or not they finished).
     pub calls: AtomicUsize,
+    /// `prompts/get` requests that reached the handler.
+    pub prompt_gets: AtomicUsize,
+}
+
+/// One prompt a [`Script`] serves: what `prompts/list` says and what `prompts/get` answers.
+#[derive(Debug, Clone)]
+pub struct TestPrompt {
+    prompt: Prompt,
+    messages: Vec<PromptMessage>,
+    /// `prompts/get` never answers.
+    hangs: bool,
+    /// `prompts/get` answers with this MCP error.
+    fails: Option<String>,
+}
+
+impl TestPrompt {
+    /// A prompt called `name` that answers with no message yet.
+    pub fn new(name: &str, description: &str) -> Self {
+        Self {
+            prompt: Prompt::new(name, Some(description), None),
+            messages: Vec::new(),
+            hangs: false,
+            fails: None,
+        }
+    }
+
+    /// Declare an argument, in order.
+    #[must_use]
+    pub fn argument(mut self, name: &str, required: bool) -> Self {
+        let mut argument = PromptArgument::new(name);
+        argument.required = Some(required);
+        self.prompt
+            .arguments
+            .get_or_insert_with(Vec::new)
+            .push(argument);
+        self
+    }
+
+    /// Answer with one more text message of the user.
+    #[must_use]
+    pub fn user(mut self, text: &str) -> Self {
+        self.messages
+            .push(PromptMessage::new_text(Role::User, text));
+        self
+    }
+
+    /// Answer with one more text message of the assistant.
+    #[must_use]
+    pub fn assistant(mut self, text: &str) -> Self {
+        self.messages
+            .push(PromptMessage::new_text(Role::Assistant, text));
+        self
+    }
+
+    /// Never answer `prompts/get` for this prompt.
+    #[must_use]
+    pub fn hangs(mut self) -> Self {
+        self.hangs = true;
+        self
+    }
+
+    /// Answer `prompts/get` for this prompt with an MCP error that says `message`.
+    #[must_use]
+    pub fn fails(mut self, message: &str) -> Self {
+        self.fails = Some(message.to_owned());
+        self
+    }
+
+    /// Answer with one more message of the user that is an image.
+    #[must_use]
+    pub fn image(mut self) -> Self {
+        self.messages.push(PromptMessage::new(
+            Role::User,
+            ContentBlock::image(base64(PNG), "image/png"),
+        ));
+        self
+    }
+}
+
+/// What a server says about itself and serves besides its tools.
+#[derive(Debug, Clone, Default)]
+pub struct Script {
+    /// The `instructions` of its `initialize` answer.
+    pub instructions: Option<String>,
+    /// The prompts it serves. `prompts/get` fills `{{name}}` in a text with the argument of that
+    /// name, so that a test can see what was sent.
+    pub prompts: Vec<TestPrompt>,
+    /// `prompts/list` never answers (a server that has the capability and does not use it).
+    pub hang_prompt_list: bool,
+    /// How long `tools/list` waits before it answers, in milliseconds.
+    pub list_tools_delay_ms: u64,
 }
 
 /// The MCP server behind the tools of the table in the [crate docs](crate).
 #[derive(Debug, Clone, Default)]
 pub struct TestServer {
     counters: Arc<Counters>,
+    script: Arc<Script>,
 }
 
 impl TestServer {
     /// A server that counts what it is asked in `counters`.
     pub fn counting(counters: Arc<Counters>) -> Self {
-        Self { counters }
+        Self::scripted(counters, Arc::new(Script::default()))
+    }
+
+    /// A server that counts what it is asked in `counters` and says and serves what `script` says.
+    pub fn scripted(counters: Arc<Counters>, script: Arc<Script>) -> Self {
+        Self { counters, script }
     }
 
     /// The tools this server offers, in the order it lists them.
@@ -163,7 +264,19 @@ fn text(text: impl Into<String>) -> CallToolResponse {
 
 impl ServerHandler for TestServer {
     fn get_info(&self) -> ServerConfig {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+        let capabilities = if self.script.prompts.is_empty() && !self.script.hang_prompt_list {
+            ServerCapabilities::builder().enable_tools().build()
+        } else {
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build()
+        };
+        let info = InitializeResult::new(capabilities);
+        match &self.script.instructions {
+            Some(text) => info.with_instructions(text.clone()),
+            None => info,
+        }
     }
 
     async fn initialize(
@@ -176,11 +289,77 @@ impl ServerHandler for TestServer {
         self.negotiate_initialize(&request)
     }
 
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        if self.script.hang_prompt_list {
+            std::future::pending::<()>().await;
+        }
+        Ok(ListPromptsResult::with_all_items(
+            self.script
+                .prompts
+                .iter()
+                .map(|p| p.prompt.clone())
+                .collect(),
+        ))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        self.counters.prompt_gets.fetch_add(1, Ordering::SeqCst);
+        let Some(found) = self
+            .script
+            .prompts
+            .iter()
+            .find(|p| p.prompt.name == request.name)
+        else {
+            return Err(McpError::invalid_params(
+                format!("no prompt `{}`", request.name),
+                None,
+            ));
+        };
+        if found.hangs {
+            std::future::pending::<()>().await;
+        }
+        if let Some(message) = &found.fails {
+            return Err(McpError::invalid_params(message.clone(), None));
+        }
+        let arguments = request.arguments.unwrap_or_default();
+        let messages = found
+            .messages
+            .iter()
+            .map(|message| match &message.content {
+                ContentBlock::Text(text) => {
+                    let mut filled = text.text.clone();
+                    for (name, value) in &arguments {
+                        if let Some(value) = value.as_str() {
+                            filled = filled.replace(&format!("{{{{{name}}}}}"), value);
+                        }
+                    }
+                    PromptMessage::new_text(message.role.clone(), filled)
+                }
+                _ => message.clone(),
+            })
+            .collect();
+        Ok(GetPromptResponse::Complete(GetPromptResult::new(messages)))
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        if self.script.list_tools_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.script.list_tools_delay_ms,
+            ))
+            .await;
+        }
         Ok(ListToolsResult::with_all_items(Self::tools()))
     }
 

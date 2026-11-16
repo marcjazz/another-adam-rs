@@ -616,6 +616,7 @@ dependencies = [
  "a2a-lf",
  "adam-a2a",
  "adam-a2a-runtime",
+ "adam-agent-fs",
  "adam-core",
  "adam-error",
  "adam-host",

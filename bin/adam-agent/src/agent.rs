@@ -173,15 +173,33 @@ pub async fn agents(
     let name = def.name().to_owned();
     // The commands the card lists (`commands/v1`): the backend expands a message that names one.
     let commands = adam_a2a_runtime::Commands::from_manifest(&def.manifest().commands);
-    let agents = match workers {
+    let (agents, commands, card) = match workers {
         Some(parts) => {
             let assembly =
                 assemble_with(def, parts.model, parts.alias, &parts.mcp, parts.step_io).await?;
-            Agents::new(name, move |builder| assembly.register(builder)).options(parts.options)
+            // The prompts of the root's MCP servers are commands too, known only now that the
+            // servers are connected: a role without workers connects none, so it serves none.
+            let (commands, listed) =
+                adam_service::with_prompt_commands(commands, assembly.prompt_commands());
+            let card = card.map(|card| adam_service::card_with_commands(card, &listed));
+            (
+                Agents::new(name, move |builder| assembly.register(builder)).options(parts.options),
+                commands,
+                card,
+            )
         }
         None => {
             let starter = LlmStarter::new(&name);
-            Agents::new(name, move |builder| builder.starter(starter))
+            // A control plane connects no MCP server, so it cannot expand a prompt: a message that
+            // names the prompt of one of the folder's servers is refused, not sent to the model as
+            // plain text.
+            let commands =
+                adam_service::refuse_prompt_commands(commands, def.manifest().mcp.as_ref());
+            (
+                Agents::new(name, move |builder| builder.starter(starter)),
+                commands,
+                card,
+            )
         }
     };
     // The person's screen is the sender: their answers through a form, and the catalog and the tools of

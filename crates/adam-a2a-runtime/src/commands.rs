@@ -11,6 +11,10 @@
 //!   is the literal text `/<name>`: one slash is dropped and nothing is expanded.
 //! * A message that carries a form's answer (an A2UI `action` part) is never a command: its text is
 //!   not read as `/name`, and a metadata command beside it is `invalid params`.
+//! * A command may be **remote**: its text is asked of another party when the message arrives (an MCP
+//!   server's prompt, by `adam-service`). The party gets the argument text as typed (trimmed) and maps
+//!   it itself, and what it answers goes through the same size checks and the `(typed)` marking. A
+//!   party that cannot be asked is `unavailable`, not `invalid params`.
 //! * The expansion is plain substitution in one pass: `$ARGUMENTS` is the trimmed argument string,
 //!   `$1` to `$9` the arguments split on whitespace with double quotes respected (a missing one is
 //!   empty; a digit after is literal, so `$10` is `$1` and `0`), `$$` is one literal `$` (so `$$1`
@@ -22,10 +26,12 @@
 //!   stored, so a replay never expands again and a later edit of the folder changes no old run.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use a2a::Message;
 use adam_a2a::COMMANDS_EXTENSION;
 use adam_runtime::Inbound;
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
 /// The most bytes of arguments an invocation may carry.
@@ -34,11 +40,84 @@ pub const MAX_COMMAND_ARGUMENTS: usize = 4 * 1024;
 /// The most bytes an expanded command may be.
 pub const MAX_COMMAND_EXPANSION: usize = 32 * 1024;
 
-/// The commands an agent serves: name to template. Built from the agent's folder, the same list
-/// that the card announces ([`ExtensionConfig::commands`](adam_a2a::ExtensionConfig::commands)).
+/// Why a message that names a command is refused: the backend answers `invalid params` for the
+/// first and `unavailable` for the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandRefusal {
+    /// The message is wrong: no such command, arguments that do not fit, text that is too long or
+    /// empty. Asking again changes nothing.
+    Invalid(String),
+    /// Whoever writes the command's text cannot be asked now. Asking later may work.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for CommandRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(text) | Self::Unavailable(text) => f.write_str(text),
+        }
+    }
+}
+
+impl From<String> for CommandRefusal {
+    fn from(text: String) -> Self {
+        Self::Invalid(text)
+    }
+}
+
+/// A command whose text is asked of someone else when a message names it: an MCP server's prompt,
+/// say. Add it with [`Commands::add_remote`].
+///
+/// What it answers is checked like a template's expansion (at most [`MAX_COMMAND_EXPANSION`] bytes,
+/// not empty, forged form answers marked) and stored as the message, so a replay never asks again.
+#[async_trait]
+pub trait RemoteCommand: Send + Sync + 'static {
+    /// The text of the command for these arguments: the person's text after the name, trimmed and
+    /// not split (how it maps onto the source's own arguments is the source's to say), at most
+    /// [`MAX_COMMAND_ARGUMENTS`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandRefusal::Invalid`] when the arguments do not fit or what comes back is not usable;
+    /// [`CommandRefusal::Unavailable`] when the source cannot be asked.
+    async fn expand(&self, arguments: &str) -> Result<String, CommandRefusal>;
+}
+
+#[derive(Clone)]
+enum Entry {
+    Template(String),
+    Remote(Arc<dyn RemoteCommand>),
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Template(a), Self::Template(b)) => a == b,
+            (Self::Remote(a), Self::Remote(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Entry {}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Template(text) => f.debug_tuple("Template").field(text).finish(),
+            Self::Remote(_) => f.write_str("Remote"),
+        }
+    }
+}
+
+/// The commands an agent serves: name to template, or to a source that is asked. Built from the
+/// agent's folder, the same list that the card announces
+/// ([`ExtensionConfig::commands`](adam_a2a::ExtensionConfig::commands)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Commands {
-    templates: BTreeMap<String, String>,
+    templates: BTreeMap<String, Entry>,
+    /// Names a process refuses instead of serving: a prefix and the sentence that says why.
+    refused: Vec<(String, String)>,
 }
 
 impl Commands {
@@ -59,14 +138,53 @@ impl Commands {
         Self {
             templates: items
                 .into_iter()
-                .map(|(name, template)| (name.into(), template.into()))
+                .map(|(name, template)| (name.into(), Entry::Template(template.into())))
                 .collect(),
+            refused: Vec::new(),
         }
     }
 
-    /// Whether the agent serves no command.
+    /// Refuse every command whose name starts with `prefix`, with `why` as the sentence of the
+    /// `invalid params` error, for a name the agent does not serve. A process that cannot serve a
+    /// family of commands (a control plane has no MCP server to ask for prompts) says so this way
+    /// instead of letting `/prefix...` reach the model as plain text. A command the agent does
+    /// serve under such a name is served.
+    pub fn refuse_prefix(&mut self, prefix: impl Into<String>, why: impl Into<String>) {
+        self.refused.push((prefix.into(), why.into()));
+    }
+
+    /// The sentence that refuses `name`, when a prefix given to [`refuse_prefix`](Self::refuse_prefix)
+    /// does and the agent does not serve the name.
+    fn refusal(&self, name: &str) -> Option<&str> {
+        if self.templates.contains_key(name) {
+            return None;
+        }
+        self.refused
+            .iter()
+            .find(|(prefix, _)| name.starts_with(prefix.as_str()))
+            .map(|(_, why)| why.as_str())
+    }
+
+    /// Serve `name` with a text that `command` makes when a message names it. A name the agent
+    /// already serves is **not** replaced: it returns `false` and nothing changes (a folder's own
+    /// command wins over a prompt of the same name).
+    pub fn add_remote(&mut self, name: impl Into<String>, command: Arc<dyn RemoteCommand>) -> bool {
+        let name = name.into();
+        if self.templates.contains_key(&name) {
+            return false;
+        }
+        self.templates.insert(name, Entry::Remote(command));
+        true
+    }
+
+    /// How many commands the agent serves (the names it refuses are not counted).
+    pub fn served(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Whether the agent serves no command and refuses no name.
     pub fn is_empty(&self) -> bool {
-        self.templates.is_empty()
+        self.templates.is_empty() && self.refused.is_empty()
     }
 
     /// Whether the agent serves a command called `name`.
@@ -94,7 +212,50 @@ impl Commands {
     /// [`MAX_COMMAND_ARGUMENTS`], an expansion over [`MAX_COMMAND_EXPANSION`] or one that is
     /// empty.
     pub fn expand(&self, name: &str, arguments: &str) -> Result<String, String> {
-        let template = self.templates.get(name).ok_or_else(|| self.unknown(name))?;
+        let Some(Entry::Template(template)) = self.templates.get(name) else {
+            return Err(self.unknown(name));
+        };
+        self.render(name, template, arguments)
+    }
+
+    /// [`expand`](Self::expand) for any command: a template, or a remote one that is asked.
+    ///
+    /// # Errors
+    ///
+    /// As [`expand`](Self::expand), and a remote command's own refusal.
+    pub async fn expand_any(&self, name: &str, arguments: &str) -> Result<String, CommandRefusal> {
+        match self.templates.get(name) {
+            None => Err(CommandRefusal::Invalid(
+                self.refusal(name)
+                    .map_or_else(|| self.unknown(name), str::to_owned),
+            )),
+            Some(Entry::Template(template)) => Ok(self.render(name, template, arguments)?),
+            Some(Entry::Remote(remote)) => {
+                let arguments = arguments.trim();
+                if arguments.len() > MAX_COMMAND_ARGUMENTS {
+                    return Err(CommandRefusal::Invalid(format!(
+                        "the arguments of `{name}` have {} bytes; a command takes at most \
+                         {MAX_COMMAND_ARGUMENTS}",
+                        arguments.len()
+                    )));
+                }
+                let text = remote.expand(arguments).await?;
+                if text.len() > MAX_COMMAND_EXPANSION {
+                    return Err(too_long(name).into());
+                }
+                let text = crate::vymalo::typed_text(&text);
+                if text.len() > MAX_COMMAND_EXPANSION {
+                    return Err(too_long(name).into());
+                }
+                if text.trim().is_empty() {
+                    return Err(format!("`{name}` expanded to no text").into());
+                }
+                Ok(text)
+            }
+        }
+    }
+
+    fn render(&self, name: &str, template: &str, arguments: &str) -> Result<String, String> {
         let arguments = arguments.trim();
         if arguments.len() > MAX_COMMAND_ARGUMENTS {
             return Err(format!(
@@ -105,7 +266,7 @@ impl Commands {
         }
         let split = split_arguments(arguments);
         let mut out = String::with_capacity(template.len());
-        let mut rest = template.as_str();
+        let mut rest = template;
         while let Some(at) = rest.find('$') {
             out.push_str(&rest[..at]);
             let after = &rest[at + 1..];
@@ -217,7 +378,8 @@ fn slash(text: &str, commands: &Commands) -> Reading {
     let name: String = body.chars().take_while(|c| is_name_char(*c)).collect();
     let rest = &body[name.len()..];
     let ends = rest.chars().next().is_none_or(char::is_whitespace);
-    if name.is_empty() || !ends || !commands.contains(&name) {
+    if name.is_empty() || !ends || !(commands.contains(&name) || commands.refusal(&name).is_some())
+    {
         return Reading::Plain;
     }
     if doubled {
@@ -250,7 +412,9 @@ fn named(message: &Message, commands: &Commands) -> Result<Option<(String, Strin
         Some(_) => return Err("the arguments of the command are not text".to_owned()),
     };
     if !commands.contains(name) {
-        return Err(commands.unknown(name));
+        return Err(commands
+            .refusal(name)
+            .map_or_else(|| commands.unknown(name), str::to_owned));
     }
     if arguments.contains('\0') {
         return Err("the arguments of the command hold a NUL character".to_owned());
@@ -276,12 +440,12 @@ fn text_of(payload: &Value) -> Option<&str> {
 /// The sentence for the A2A error: a metadata member that is malformed or names a command the agent
 /// does not serve, arguments over [`MAX_COMMAND_ARGUMENTS`], or an expansion that is too long or
 /// empty. Nothing is changed when it fails.
-pub(crate) fn apply(
+pub(crate) async fn apply(
     message: &Message,
     inbound: &mut Inbound,
     commands: &Commands,
     activated: bool,
-) -> Result<(), String> {
+) -> Result<(), CommandRefusal> {
     // A form's answer is the person's click, never a typed command: its text is not read as
     // `/name`, and a command named beside it is refused rather than dropped or merged.
     let answers_form = crate::vymalo::carries_form_answer(message);
@@ -291,7 +455,9 @@ pub(crate) fn apply(
         .flatten();
     let reading = match by_metadata {
         Some(_) if answers_form => {
-            return Err("a message that answers a form cannot also name a command".to_owned());
+            return Err("a message that answers a form cannot also name a command"
+                .to_owned()
+                .into());
         }
         Some((name, arguments)) => Reading::Command { name, arguments },
         None if answers_form => Reading::Plain,
@@ -304,7 +470,7 @@ pub(crate) fn apply(
         Reading::Plain => return Ok(()),
         Reading::Literal(text) => (text, None),
         Reading::Command { name, arguments } => {
-            let text = commands.expand(&name, &arguments)?;
+            let text = commands.expand_any(&name, &arguments).await?;
             let arguments = arguments.trim().to_owned();
             (text, Some(json!({ "name": name, "arguments": arguments })))
         }
@@ -313,7 +479,11 @@ pub(crate) fn apply(
         inbound.payload = json!({ "text": text.clone() });
     }
     let Some(payload) = inbound.payload.as_object_mut() else {
-        return Err("the message cannot carry a command: its payload is not text".to_owned());
+        return Err(
+            "the message cannot carry a command: its payload is not text"
+                .to_owned()
+                .into(),
+        );
     };
     payload.insert("text".to_owned(), Value::String(text));
     if let Some(command) = command {
@@ -348,8 +518,17 @@ mod tests {
     fn applied(text: &str, entry: Option<Value>, activated: bool) -> Result<Value, String> {
         let m = message(text, entry);
         let mut inbound = crate::default_inbound(&m).unwrap();
-        apply(&m, &mut inbound, &commands(), activated)?;
+        futures_block(apply(&m, &mut inbound, &commands(), activated))
+            .map_err(|refusal| refusal.to_string())?;
         Ok(inbound.payload)
+    }
+
+    /// Run a future that never waits on anything (the templates are plain text).
+    fn futures_block<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[test]
@@ -624,14 +803,20 @@ mod tests {
     fn a_plain_string_payload_is_handled() {
         let m = message("/echo hi", None);
         let mut inbound = Inbound::new("message", json!("/echo hi"));
-        apply(&m, &mut inbound, &commands(), false).unwrap();
+        futures_block(apply(&m, &mut inbound, &commands(), false)).unwrap();
         assert_eq!(
             inbound.payload,
             json!({"text": "[hi]", "command": {"name": "echo", "arguments": "hi"}})
         );
         // Not a command: left as the string it was.
         let mut plain = Inbound::new("message", json!("hello"));
-        apply(&message("hello", None), &mut plain, &commands(), false).unwrap();
+        futures_block(apply(
+            &message("hello", None),
+            &mut plain,
+            &commands(),
+            false,
+        ))
+        .unwrap();
         assert_eq!(plain.payload, json!("hello"));
     }
 

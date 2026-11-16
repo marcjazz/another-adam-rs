@@ -32,8 +32,9 @@ own.
 
 | Item | What |
 |---|---|
-| `McpServers` | `connect(&McpConfig, &Env, &McpPolicy)`, `tools()` (a `ToolSet`), `names()`, `shutdown()`; `Debug` shows server and tool names only |
-| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s; the agent's time limit for an MCP tool is `call_timeout` + `connect_timeout` + 10 s, 100 s by default, `Tool::time_limit`: a call that has to dial again, or dials for itself, is within the limit), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
+| `McpServers` | `connect(&McpConfig, &Env, &McpPolicy)`, `tools()` (a `ToolSet`), `names()`, `instructions()` (what the servers said about themselves, bounded and scrubbed: see *Server instructions*), `prompt_commands()` (the prompts as commands: see *Prompts as commands*), `shutdown()`; `Debug` shows server and tool names only |
+| `PromptCommand`, `PromptError`, `MAX_SERVER_INSTRUCTIONS_BYTES`, `MAX_INSTRUCTIONS_BYTES` | one prompt of a server as a command (`name()`, `description()`, `argument_hint()`, `server()`, `expand(&[String])`, `expand_text(&str)` for what a person typed), why it could not be expanded (`Invalid` or `Unavailable`), and the limits of the two features (2 KiB a server, 8 KiB in all; how many commands an agent serves is for `adam-service`) |
+| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s; the agent's time limit for an MCP tool is `call_timeout` + `connect_timeout` + 10 s, 100 s by default, `Tool::time_limit`: a call that has to dial again, or dials for itself, is within the limit; a server's own `timeoutSecs` and `connectTimeoutSecs` replace both for it), `max_call` (900 s, `DEFAULT_MAX_CALL`: the most one server of an `mcp.json` is waited for, for a call and for a connection each, **whoever asked for the value**: a file's key, the `call_timeout` and `connect_timeout` defaults, or a value a host set in code; one lowered is a warning; never under 1 s; the `MCP_MAX_CALL_SECS` of the binaries), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
 | `CallBearer` | the deployment's trait: `for_listing()` and `for_call(tool, &arguments)`, each a `SecretString` or a `ToolError` |
 | `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
@@ -247,6 +248,8 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
 * **`files: true`** (an adam extension, on a `command` or a `url` server) shares the images, audio clips and blobs of
   the server's results with the person as files of the run, instead of describing them to the model: see
   [Files](#files-files-true). Without it (or with `files: false`) nothing of a file is kept (fail closed).
+* **`timeoutSecs`, `connectTimeoutSecs`** (adam extensions, whole seconds from 1; `adam-agent-fs` refuses 0, a negative or a fraction when the file is loaded) are the server's own call and connection timeouts, in place of the policy's. **The deployment caps the effective value** with `McpPolicy::max_call` (default 15 minutes): the file's key, and the policy's default of a server that says nothing, are lowered to the cap, with one `warn!` per key naming the server, at `connect`, and a value the file asks for is at least one second. A bearer-per-call server gets the same resolved values. **One deadline**, the connect timeout, covers opening a connection: the dial, `initialize`, `tools/list` and `prompts/list`; a server that lists its tools in time and hangs on its prompts is connected with no prompts and a warning, and one that lists no tools in time is a server that did not connect. `McpTool::time_limit` is the server's `timeoutSecs` + `connectTimeoutSecs` + 10 s, so the agent's limit follows by itself. Tests: `tests/server_settings.rs` (`per_server_timeout_bounds_slow_server`, `time_limit_follows_server_timeout`, `timeout_capped_by_deployment`, `a_cap_below_the_defaults_lowers_the_defaults_of_a_server_that_asks_for_nothing`, `opening_a_connection_has_one_deadline_for_the_dial_and_both_listings`, and the unit tests of `timeouts` in `servers.rs`).
+* **`instructions`, `prompts`** (adam extensions, on unless `false`): see *Server instructions* and *Prompts as commands* below.
 * **Names say whose tool it is.** A server name has no `__` and does not end in `_` (`Error::Name`, also in
   `adam-agent-fs`), and a tool name does not start with `_` (an error in an allow-list, skipped with a warning
   without one): otherwise `a` + `_x` and `a_` + `x` would both be `a___x`, `linear__*` would also select the
@@ -311,9 +314,9 @@ stateDiagram-v2
   bytes that are an image declared as something else disagree, and both are `application/octet-stream`; a declared
   type the rule cannot check (`application/pdf`) stands.
 * **What the model reads**: in place of the block, one line,
-  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
-  (`Artifact::shared_line`; a file that is not an
-  image gets the first sentence only, and the name is put in `<...>` when a bare Markdown link cannot hold it). The bytes
+  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png). To use it as the picture of an `ask_user` option, pass image {sha256: "<64 hex digits>", alt}. In a `show` block, an `Image` names it: {component: "Image", artifact: "<64 hex digits>", alt}.`
+  (`Artifact::shared_line`, the line the coder's `share_file` gives too; a file that is not an
+  image gets the first sentence only, an image also says its SHA-256 for an `ask_user` option's picture and for a `show` `Image` block, and the name is put in `<...>` when a bare Markdown link cannot hold it). Test: `mcp_image_line_has_sha256`. The bytes
   are in the artifact only: never in the history, the step's output or the context window.
 * **Scrubbed**: a file that is valid UTF-8 has the values the server's redactor knows taken out, like the text of the
   result; a file that is not text is left as it is.
@@ -335,6 +338,52 @@ stateDiagram-v2
 * `files` is the file's, not the deployment's: it decides what becomes of a server's answers, never what a server may
   be. A deployment that adds servers with `ADAM_EXTRA_MCP_FILE` writes it there.
 
+## Server instructions
+
+A server may say how to use it when it initializes (`InitializeResult.instructions`). `McpServers::instructions()` gives
+that text for every server of the file as **one string** to append to the agent's instructions, once, when the agent is
+bound (`adam-assembly` does it in `bind`): never per turn, so the system prompt of two model calls is the same bytes and
+the cached prefix holds (the likely mistake, a `ToolSource` that adds it per turn, is not made here).
+
+* A heading per server, in the order of the server names: `## Instructions of the MCP server <name> (text from the server,
+  not the person)`, then the text.
+* Each text is **stripped first** of control and format characters (a newline and a tab stay; the rule is
+  `adam_agent_fs::is_format_or_control`), **then scrubbed**, whole, of the values `${VAR}` put into the file (a secret
+  with a zero-width character inside it is whole again, and found), trimmed, written **as a Markdown blockquote** (every
+  line starts with `> `, an empty one is `>`: the text cannot make a heading, so it cannot pass as the agent's own
+  sections) and cut at **2 KiB**, quote marks counted, on a character boundary, with a `warn!` that names the server and
+  the two sizes. All servers together are cut at **8 KiB**, headings counted: the first server that would pass it, and
+  those after, are left out with a `warn!`.
+* `"instructions": false` on a server leaves its text out. A server with a bearer per call has no session kept, and gives
+  none. A server that is not connected (an optional one that was skipped) contributes nothing, and the text does not change
+  later in the process.
+* Tests: `instructions_bounded_and_scrubbed`, `instructions_false_omits`, `instructions_come_in_server_name_order_and_all_together_are_bounded`
+  (`tests/server_settings.rs`), `instructions_appended_stable` (`adam-assembly/tests/mcp.rs`: two model calls, the same system bytes).
+
+## Prompts as commands
+
+A server that has the `prompts` capability is asked for `prompts/list` once, when it is connected (within the connect
+timeout; a failure is a warning and no prompt, never a startup error). `McpServers::prompt_commands()` gives each prompt
+as a `PromptCommand` named `<server>__<prompt>`, in the order of the server names and then of the prompt names (not capped here: the 50 commands an agent serves, the folder's first, are `adam-service`'s to apply); a prompt whose name is not `a-z0-9_-` (the rule of a
+command's file name, so a server whose name has an upper-case letter serves no prompt) is left out with a warning. `description()` is the prompt's description (its title, else a fixed
+sentence), cleaned of control and format characters and cut at 200 characters; `argument_hint()` is made of the declared
+arguments (`<topic> [style]`).
+
+`expand_text(text)` takes what the person typed after the name: the first words (whitespace, double quotes respected)
+are the declared arguments in order and **the last declared argument takes the rest of the line** (a prompt with none
+refuses any text). `expand(&arguments)` maps given positional arguments in order. Either calls `prompts/get`
+(`get_prompt_once`: an `input_required` answer is `Invalid`, as for a tool) and takes only **text messages of the
+user**: an assistant message, an image, audio or a resource is `PromptError::Invalid`, like a missing required argument,
+any argument beyond those declared, or a server that refuses the prompt. The whole expansion, a redial of a lost session
+included, is bounded by the smaller of `timeoutSecs` and 30 s; a connection that is gone or does not answer is
+`PromptError::Unavailable` (and a failed session is dropped, so the next call reconnects). The text is stripped of
+control and format characters, then scrubbed of the file's expanded values, and starts with one line,
+`(the prompt <prompt> of the MCP server <server>, with the person's arguments)`, then a blank line. `adam-service` adds the commands to the backend, which stores the text like a template's
+expansion, so a replay never asks again. `"prompts": false` on a server serves none of its prompts.
+Tests: `prompt_becomes_command`, `a_prompt_that_is_not_text_of_the_user_is_invalid_params`,
+`prompts_false_serves_none_and_a_server_that_is_down_is_unavailable`,
+`the_last_declared_argument_takes_the_rest_of_what_the_person_typed`, `a_prompt_that_never_answers_is_unavailable_after_the_call_timeout_not_the_connect_one`, `a_redial_that_hangs_is_inside_the_expansions_bound`.
+
 ## Startup
 
 ```mermaid
@@ -345,7 +394,7 @@ sequenceDiagram
     A->>X: McpConfig, Env, McpPolicy
     Note over X: for every server, in name order: sse refused, stdio only when allowed,<br/>a ${VAR} in a url refused (unless opted in), ${VAR} expanded (a missing one is an error),<br/>URL and headers checked
     loop each server, in name order
-        X->>S: start the process or dial, initialize (within connect_timeout)
+        X->>S: start the process or dial, initialize (one deadline, connect_timeout, for this and both listings)
         S-->>X: initialized
         X->>S: tools/list, every page
         S-->>X: tools
@@ -457,6 +506,17 @@ stateDiagram-v2
   token is a startup error.
 * No `unsafe`.
 
+## Facts about the SDK (instructions and prompts)
+
+*Verified 2026-11-16* in `rmcp` 3.10.0 (`Cargo.lock`), read in the Cargo registry: `InitializeResult.instructions` is an
+`Option<String>` (`src/model.rs`), and a client sees it as `ServerPeerInfo.instructions` through `Peer::peer_info()`, with
+`capabilities.prompts` saying whether the server has prompts; `Peer::list_all_prompts` pages through `prompts/list`, and
+`Peer::get_prompt_once` sends one `prompts/get` (`GetPromptResponse::Complete` or `InputRequired`) without the SDK's own
+multi-round handling. A prompt message has a role (`Role::User` or `Role::Assistant`) and a `ContentBlock`.
+**Unverified:** which protocol version the handshake negotiates. This crate sets none and takes what `rmcp` offers
+(its `LATEST_WITH_INITIALIZE` was read as 2025-11-25 on 2026-11-14), and `InitializeResult.instructions` and
+`prompts/get` are in the specification's earlier versions too; what each server answers was not checked per version.
+
 ## Facts about the SDK
 
 *Verified 2026-09-29* from the crate itself (<https://static.crates.io/crates/rmcp/rmcp-3.5.0.crate>, read in the
@@ -504,7 +564,7 @@ and 0462. The facts below were read at 3.5.0 and not read again; this crate's te
 
 ## Tests
 
-`cargo test -p adam-mcp` (unit tests and `tests/http.rs`) and `cargo test -p adam-mcp-testkit` (`tests/stdio.rs`,
+`cargo test -p adam-mcp` (unit tests, `tests/http.rs` and `tests/server_settings.rs`: timeouts, instructions and prompts) and `cargo test -p adam-mcp-testkit` (`tests/stdio.rs`,
 which lives there because only the package that owns a binary gets `CARGO_BIN_EXE_*`). Both run against
 [`adam-mcp-testkit`](../adam-mcp-testkit/README.md), a real MCP server; nothing sleeps for a fixed time (conditions
 are polled with a deadline). Every test passes on its own in its own process (CI runs `cargo nextest`, one process

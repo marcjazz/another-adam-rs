@@ -25,6 +25,7 @@ mod error;
 mod expand;
 mod once;
 mod policy;
+mod prompts;
 mod redact;
 mod servers;
 mod text;
@@ -35,8 +36,9 @@ pub use error::{Error, UrlProblem, VarProblem};
 pub use expand::Env;
 pub use once::{CallOptions, Endpoint, EndpointError, RemoteResult, RemoteTool};
 pub use policy::{
-    CallBearer, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_THREAD_TOOLS_MAX_CALL,
-    McpPolicy,
+    CallBearer, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CALL,
+    DEFAULT_THREAD_TOOLS_MAX_CALL, McpPolicy,
 };
-pub use servers::McpServers;
+pub use prompts::{PromptCommand, PromptError};
+pub use servers::{MAX_INSTRUCTIONS_BYTES, MAX_SERVER_INSTRUCTIONS_BYTES, McpServers};
 pub use text::MAX_RESULT_BYTES;
