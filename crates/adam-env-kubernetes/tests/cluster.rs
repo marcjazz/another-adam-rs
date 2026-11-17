@@ -37,6 +37,9 @@ use adam_env_kubernetes::{
     KubeEnvironment, Placement, PodTemplate, Settings, SlotMount, WorkspaceMounts, WorktreeDirs,
     pod_name, run_hash,
 };
+use adam_workspace::testing_stdio::{
+    StdioProbe, framed_stdio_until_eof, framed_stdio_until_kill, silence,
+};
 use adam_workspace::{
     EnvError, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, NoProgress,
     StaticToken, Workspaces,
@@ -277,11 +280,60 @@ async fn against_a_real_cluster() {
     release_and_held_runs(&cluster).await;
     a_run_pod_sees_only_its_own_run(&cluster).await;
     the_admission_policy_refuses_everything_but_the_intended_pod(&cluster).await;
+    // Before the quota scenario, which fills the namespace and leaves its pods terminating: this one
+    // needs a pod of its own, and waits until that pod is gone before the quota is counted.
+    a_server_keeps_its_conversation_on_stdin_and_stdout(&cluster).await;
     if cluster.quota_pods.is_some() {
         the_quota_refuses_a_pod_beyond_its_limit(&cluster).await;
     } else {
         eprintln!("skipped the quota scenario: ADAM_TEST_KUBE_QUOTA_PODS is not set");
     }
+}
+
+/// A framed conversation on stdin and stdout, as a language server has: a first message, stdin held open
+/// through a silence (`ADAM_TEST_STDIO_SILENCE_SECS`, 20 s by default; the kind script asks for 90), a
+/// 64 KiB message, then EOF (the command ends by itself with status 0) or a kill (nothing of it is left in
+/// the pod). `adam_workspace::testing_stdio` says each step.
+async fn a_server_keeps_its_conversation_on_stdin_and_stdout(c: &Cluster) {
+    eprintln!("--- stdin and stdout");
+    let env = c.environment(c.settings());
+    let run_id = c.run_id("stdio");
+    let ws = c.workspaces().run(&run_id).unwrap();
+    let session = env.ensure(&ws, &NoProgress).await.unwrap();
+    let cwd = c.make_workdir(&run_id).await;
+    let eof =
+        framed_stdio_until_eof(session.as_ref(), &StdioProbe::new(&cwd).silence(silence())).await;
+    let killed = framed_stdio_until_kill(
+        session.as_ref(),
+        &StdioProbe::new(&cwd).silence(Duration::from_secs(1)),
+    )
+    .await;
+    let failures: Vec<String> = [("until EOF", eof), ("until kill", killed)]
+        .into_iter()
+        .filter_map(|(what, result)| result.err().map(|e| format!("{what}: {e}")))
+        .collect();
+    for failure in &failures {
+        eprintln!("stdin and stdout: {failure}");
+    }
+    if failures.is_empty() {
+        eprintln!(
+            "stdin and stdout: both cases held, with a silence of {:?}",
+            silence()
+        );
+    }
+    // Released, and gone, before the verdict: a failure leaves no pod to count against the quota.
+    env.release(&run_id).await.unwrap();
+    c.wait_for(
+        "the pod of the stdin scenario to be gone",
+        120,
+        async || c.gone(&run_id).await,
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "a framed conversation on stdin and stdout through adam-kube-exec in a run pod:\n{}",
+        failures.join("\n")
+    );
 }
 
 async fn commands_run_in_the_runs_own_pod(c: &Cluster) {
