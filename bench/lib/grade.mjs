@@ -33,21 +33,55 @@ export class PatchTooLarge extends Error {
 }
 
 /** What git runs with on the harness's side: no system or global configuration, no hooks, attributes, fsmonitor or textconv. */
-const SAFE_C = ['-c', 'core.quotepath=off', '-c', 'core.autocrlf=false', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.ext.allow=never'];
+export const SAFE_C = ['-c', 'core.quotepath=off', '-c', 'core.autocrlf=false', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.ext.allow=never'];
 const emptyHome = () => {
   emptyHome.dir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'bench-git-home-'));
   return emptyHome.dir;
 };
 
+const ENV_ALLOW = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'SYSTEMROOT'];
+
 /**
- * The environment git runs in on the harness's side: no system or global configuration, no configuration that
- * arrives through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its KEY/VALUE pairs), and an
+ * The environment a host git runs in: an allow-list, nothing else. Git needs no key, no proxy and no credential, so
+ * none of them is here (the model's key is in the harness's own environment); no system or global configuration, none
+ * that arrives through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its KEY/VALUE pairs), and an
  * empty HOME and XDG_CONFIG_HOME so no user file is found.
  */
 export function safeEnv(home = emptyHome()) {
-  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', HOME: home, XDG_CONFIG_HOME: home };
-  for (const k of Object.keys(env)) if (/^GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/.test(k) || k === 'GIT_DIR' || k === 'GIT_WORK_TREE' || k === 'GIT_INDEX_FILE') delete env[k];
+  const env = {};
+  for (const k of ENV_ALLOW) if (process.env[k] !== undefined) env[k] = process.env[k];
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', HOME: home, XDG_CONFIG_HOME: home });
   return env;
+}
+
+/**
+ * Git with no repository around it: run in a new empty directory that is not a repository, with discovery stopped
+ * above it, only the plain http protocol allowed and nothing a repository could say read. For what the host asks of a
+ * server (`ls-remote`), never for a directory a container wrote. Returns stdout as a Buffer.
+ */
+export async function isolatedGit(args, { maxBytes = 1024 * 1024, timeoutMs = 60_000 } = {}) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-isolated-'));
+  try {
+    return await new Promise((resolve, reject) => {
+      const env = { ...safeEnv(cwd), GIT_CEILING_DIRECTORIES: path.dirname(cwd) };
+      const child = spawn('git', [...SAFE_C, '-c', 'protocol.allow=never', '-c', 'protocol.http.allow=always', ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL' });
+      const chunks = [];
+      let size = 0;
+      let err = '';
+      child.stdout.on('data', (c) => {
+        size += c.length;
+        if (size > maxBytes) child.kill('SIGKILL');
+        else chunks.push(c);
+      });
+      child.stderr.on('data', (c) => {
+        if (err.length < 2000) err += c;
+      });
+      child.on('error', reject);
+      child.on('close', (code) => (code === 0 && size <= maxBytes ? resolve(Buffer.concat(chunks)) : reject(new Error(`git ${args[0]} failed (${code}): ${err.trim().split('\n')[0]}`))));
+    });
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 /** A `git(args, { maxBytes })` that runs git in `dir`, safely, and returns stdout as a Buffer. */
@@ -296,6 +330,53 @@ export function gradeScript({ workdir = '/app', cloneTo = null } = {}) {
 }
 
 const STALE_SLACK_MS = 1000;
+export const MAX_REWARD_BYTES = 16;
+
+/** The reward text of what a container left, or 'invalid' for anything that is not a small regular file. */
+export const rewardOf = (raw) => (/^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid');
+
+/**
+ * Where a grading's files live. The default is the host's own: a directory of the harness's, made empty for each
+ * attempt, handed to the container and read after it ends. The reward file is one a container wrote, so it is opened
+ * without following a link and without blocking (a FIFO would hang the harness) and is read only if it is a regular
+ * file of at most 16 bytes; anything else is 'invalid'. The service-backed one (`Stack.graderIO`) keeps the files
+ * inside the grader and moves them as tar streams.
+ *   stage({ task, patchFile }) -> { mounts, readReward(startedMs) -> { reward, stale }, remove() }
+ */
+export function hostGradeIO(workRoot = os.tmpdir()) {
+  return {
+    async stage({ task, patchFile }) {
+      const logs = fs.mkdtempSync(path.join(workRoot, 'grade-logs-'));
+      fs.chmodSync(logs, 0o777);
+      const mounts = [
+        { source: path.join(task.dir, 'tests'), target: '/tests', readOnly: true },
+        { source: logs, target: '/logs/verifier' },
+      ];
+      if (patchFile) mounts.push({ source: path.resolve(patchFile), target: '/patch/model.patch', readOnly: true });
+      return {
+        mounts,
+        async readReward(startedMs) {
+          let fd;
+          try {
+            fd = fs.openSync(path.join(logs, 'reward.txt'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+          } catch (e) {
+            return { reward: e.code === 'ENOENT' ? null : 'invalid', stale: false };
+          }
+          try {
+            const st = fs.fstatSync(fd);
+            if (!st.isFile() || st.size > MAX_REWARD_BYTES) return { reward: 'invalid', stale: false };
+            return { reward: rewardOf(fs.readFileSync(fd, 'utf8')), stale: st.mtimeMs < startedMs - STALE_SLACK_MS };
+          } finally {
+            fs.closeSync(fd);
+          }
+        },
+        async remove() {
+          fs.rmSync(logs, { recursive: true, force: true });
+        },
+      };
+    },
+  };
+}
 
 /**
  * One grading run, in a directory of its own that is empty when the container starts and is read only after
@@ -303,37 +384,21 @@ const STALE_SLACK_MS = 1000;
  * attempt, and no error. A reward of 1 with another exit status is a fail and `suspect`.
  * Returns { pass, reward, error, exitCode, suspect }.
  */
-export async function gradeOnce({ containers, task, patchFile = null, cloneTo = null, workRoot = os.tmpdir(), timeoutMs = 30 * 60 * 1000 }) {
-  const logs = fs.mkdtempSync(path.join(workRoot, 'grade-logs-'));
-  fs.chmodSync(logs, 0o777);
+export async function gradeOnce({ containers, task, patchFile = null, cloneTo = null, workRoot = os.tmpdir(), timeoutMs = 30 * 60 * 1000, io = hostGradeIO(workRoot) }) {
+  const staged = await io.stage({ task, patchFile });
   try {
-    const mounts = [
-      { source: path.join(task.dir, 'tests'), target: '/tests', readOnly: true },
-      { source: logs, target: '/logs/verifier' },
-    ];
-    if (patchFile) mounts.push({ source: path.resolve(patchFile), target: '/patch/model.patch', readOnly: true });
     const startedMs = Date.now();
     const r = await containers.run({
       image: task.image.ref,
       script: gradeScript({ workdir: task.workdir, cloneTo }),
       workdir: '/',
-      mounts,
+      mounts: staged.mounts,
       network: verifierNetwork(task),
       cpus: task.cpus,
       memoryMb: task.memoryMb,
       timeoutMs,
     });
-    let reward = null;
-    let stale = false;
-    try {
-      const file = path.join(logs, 'reward.txt');
-      stale = fs.statSync(file).mtimeMs < startedMs - STALE_SLACK_MS;
-      // exactly 1 or 0, with at most one newline after it: nothing else is a reward
-      const raw = fs.readFileSync(file, 'utf8');
-      reward = /^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid';
-    } catch {
-      reward = null;
-    }
+    const { reward, stale } = await staged.readReward(startedMs);
     const suspect = [];
     let error = null;
     if (r.timedOut) error = 'timeout';
@@ -348,7 +413,7 @@ export async function gradeOnce({ containers, task, patchFile = null, cloneTo = 
     }
     return { pass: error === null && reward === '1', reward, error, exitCode: r.exitCode, suspect };
   } finally {
-    fs.rmSync(logs, { recursive: true, force: true });
+    await staged.remove();
   }
 }
 
@@ -367,7 +432,7 @@ export async function gradeAttempt(opts) {
  * never a fail) when an attempt stays an infrastructure error. The patch is stripped first (`sanitizePatch`);
  * `removed` and `suspect` say what was taken out and what a person should read.
  */
-export async function gradePatch({ containers, task, patchFile = null, workRoot = os.tmpdir(), hiddenTests, timeoutMs }) {
+export async function gradePatch({ containers, task, patchFile = null, workRoot = os.tmpdir(), hiddenTests, timeoutMs, io }) {
   let mounted = patchFile;
   let removed = [];
   let suspect = [];
@@ -381,7 +446,7 @@ export async function gradePatch({ containers, task, patchFile = null, workRoot 
       if (mounted) fs.writeFileSync(mounted, s.patch);
     }
     const attempts = [];
-    for (let i = 0; i < GRADE_ATTEMPTS; i++) attempts.push(await gradeAttempt({ containers, task, patchFile: mounted, workRoot, timeoutMs }));
+    for (let i = 0; i < GRADE_ATTEMPTS; i++) attempts.push(await gradeAttempt({ containers, task, patchFile: mounted, workRoot, timeoutMs, io }));
     for (const a of attempts) for (const s of a.suspect) if (!suspect.includes(s)) suspect.push(s);
     const invalid = attempts.some((a) => a.invalid);
     const passes = attempts.filter((a) => a.pass).length;
