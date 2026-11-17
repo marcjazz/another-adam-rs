@@ -4,11 +4,11 @@ Runs the same tasks through two agents, `adam-coder` and OpenCode, on one model 
 in a pristine image and reports pass rates with intervals and what they cost. Decision and shape:
 [ADR 0048](../docs/decisions/0048-a-benchmark-harness-for-adam-coder-and-opencode.md).
 
-**Built so far (pull request 1 of 4):** the meter, the cost and the cap, the ledger, the configuration and its
-guards, the statistics and the report. **Not built yet:** task sources and grading (pull request 2), the agent
-drivers, the compose stack and the dry run (3), `pilot` and `run` (4). `node bench/bin/bench.mjs doctor`, `tasks`,
-`pilot`, `run` and `regrade` exit 2 with "not built yet" until then. Node 24 (CI), no dependencies: only Node's
-standard library.
+**Built so far (pull requests 1 and 2 of 4):** the meter, the cost and the cap, the ledger, the configuration and its
+guards, the statistics and the report; the task sources (public and own), the statement lint, selection, the
+environment check and grading by patch replay. **Not built yet:** the agent drivers, the compose stack and the dry
+run (3), `pilot` and `run` (4). `node bench/bin/bench.mjs doctor`, `pilot`, `run` and `regrade` exit 2 with "not built
+yet" until then. Node 24 (CI), no dependencies: only Node's standard library.
 
 ## What it never holds
 
@@ -56,6 +56,7 @@ Every value below is made up.
 | `keyEnv` | the environment variable that holds the key (default `BENCH_MODEL_API_KEY`) |
 | `concurrency` | runs at once, 1 to 8 (default 2) |
 | `contextWindow`, `timeouts` | optional: the context window, and the meter's first-byte and idle timeouts in seconds |
+| `tasks` | optional: task sources and grading, see Tasks |
 
 The file is `$BENCH_CONFIG` (default `~/.config/adam-bench/config.json`); results are in `$BENCH_HOME`
 (default `~/.local/share/adam-bench`, also refused inside a work tree, as are `--ledger` and `--out`). The schema is `SCHEMA` in
@@ -76,7 +77,7 @@ sequenceDiagram
     participant Me as meter (lib/meter.mjs)
     participant E as the owner's endpoint
     participant A as agent (adam coder or OpenCode)
-    participant R as grader (pristine task image)
+    participant R as grader (pristine task image, lib/grade.mjs)
     H->>L: reserve the per-run budget (lib/cap.mjs)
     H->>Me: open the run with its token and its arm fragment
     Note over H,A: preparing the task and starting the agent: not built yet (pull requests 2 and 3)
@@ -88,7 +89,11 @@ sequenceDiagram
         Me->>L: settled record with the actual cost (lib/cost.mjs)
         Me-->>A: response
     end
-    Note over H,R: collecting the patch and grading three times: not built yet (pull request 2)
+    H->>H: collect the patch of the final tree, at most 5 MB (collectPatch in lib/grade.mjs)
+    loop three times
+        H->>R: pristine container of the task image: git apply model.patch, /tests read-only, bash /tests/test.sh
+        R-->>H: /logs/verifier/reward.txt, 1 or 0
+    end
     H->>L: Done with the result, the unused reservation is free
     H->>L: the report reads the ledger (lib/report.mjs)
 ```
@@ -138,6 +143,17 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/scripted-model.mjs` | an OpenAI-compatible server for the tests |
 | `bench/lib/stats.mjs` | Wilson intervals, the exact McNemar test, a seeded bootstrap |
 | `bench/lib/report.mjs` | the report |
+| `bench/lib/toml.mjs` | the TOML subset of `task.toml` |
+| `bench/lib/task.mjs` | the task format and its validator |
+| `bench/lib/upstream.mjs` | the pinned clone of the public tasks and `SHA256SUMS` |
+| `bench/lib/mine.mjs` | the miner |
+| `bench/lib/own.mjs` | own tasks: their spec, the image's Dockerfile, the task directory built from a clone |
+| `bench/lib/lint.mjs` | the statement lint |
+| `bench/lib/select.mjs` | seeded stratified selection, the lock files |
+| `bench/lib/containers.mjs` | the container runtime interface: `PodmanRemote` and `FakeContainers` |
+| `bench/lib/grade.mjs` | patch collection and grading by replay |
+| `bench/lib/envcheck.mjs` | the environment check |
+| `bench/lib/tasks-cli.mjs` | `bench tasks ...` |
 
 **Cost.** A call costs `(input - cached - cache write) * input price + cached * cached price + cache write * write
 price + output * output price`, rounded up to a micro-dollar; reasoning is inside the output. A call with no usable
@@ -179,14 +195,135 @@ says that runs in `StoppedByCap`, `Failed_infra`, `NotStarted` (and any other st
 with what each wasted. Two `Done` runs for one task, agent and arm are an error that names them. Pipes and line
 breaks in a cell are escaped.
 
+## Tasks
+
+Two sources, **one format** (the Harbor layout of SWE-bench Pro V2, `bench/lib/task.mjs`):
+
+```
+<id>/instruction.md        the statement
+<id>/task.toml             [agent] network_mode = "none"; [verifier] network_mode; [environment] cpus, memory_mb,
+                           optional docker_image and workdir; optional [metadata] repo, language
+<id>/environment/          a Dockerfile whose first FROM names the image (or docker_image in task.toml)
+<id>/tests/test.sh         writes /logs/verifier/reward.txt: 1 pass, 0 fail
+<id>/solution/             the gold change as a *.patch (used by the environment check only)
+```
+
+The validator refuses a task with a part missing, a `task.toml` it cannot read (the reader, `bench/lib/toml.mjs`,
+takes the subset the format uses and names the line), an image not pinned by digest, and an agent network mode other
+than none (`no-network` is read as none). Upstream names images by tag; `bench tasks check` resolves each tag to a
+digest and keeps it in `$BENCH_HOME/tasks/pins.json`, and the pin is what a task runs by.
+
+| Source | Where | What the repository holds |
+|---|---|---|
+| public: SWE-bench Pro V2 | `scaleapi/SWE-bench_Pro-os` cloned under `$BENCH_HOME/upstream` at **the commit you pin** (`tasks.upstreamCommit`; there is no default) | `bench/tasks/public.lock.json`: ids, checksums, image digests, the seed. **No task content, ever.** |
+| own: mined from your clones | full local clones you name in `tasks.clones` | `bench/tasks/own/<id>/`: your `instruction.md` and `own.json` (commit ids, test command, toolchain pins), the lock `own.lock.json`. No hidden test content: it is read from the clone when the task is built |
+
+```json
+"tasks": {
+  "upstreamCommit": "0123456789abcdef0123456789abcdef01234567",
+  "clones": { "demo": "/home/me/src/demo" },
+  "workspaceImage": "registry.example.test/workspace@sha256:<64 hex digits>",
+  "podman": { "connection": "bench-slot-1" }
+}
+```
+
+`upstreamUrl` (default the public repository; `https:`, `file:`, `ssh:` or an absolute path, never beginning with `-`),
+`upstreamDir` (default `v2`), `selfRepo` (the agent's own repository, default `another-adam-rs`, `null` for no cap of
+its own), `seed` (default `1`), `verifierNetworks` (names of networks a verifier may use, see Grading) and `podman`
+(`connection`, a plain name, or `url`, `unix://` or `ssh://`, of the Podman service, as `podman --remote` takes them)
+are the other fields. The task commands read the same file as the rest, so it must be a
+whole configuration.
+
+**Fetch.** `bench tasks fetch` clones the upstream repository, checks out the pinned commit, checks every file against
+`v2/SHA256SUMS` and lists the tasks. The check is of the whole tree: every file of a task must be listed, there must be no
+symlink anywhere, and a listed path must be in its normal form (`a//b` and `a/../b` are refused). A reused clone is cleaned
+(`git clean -ffdx`) and its origin must be the configured URL. A task's checksum in the lock is the hash of its
+`SHA256SUMS` lines. A task directory may hold no symlink either.
+
+**Mine.** `bench tasks mine` walks the first-parent history of `main` in each clone and keeps a commit that
+
+* has one parent and a subject ending `(#N)` (a squashed pull request) and is not `docs`, `chore`, `ci`, `style`,
+  `build`, `test`, `refactor` or a revert;
+* touches a test file and a source file, by path (`tests/`, `testing/`, `*.test.ts`, `*_test.go`, `*_tests.rs`, `tests.rs`, ...);
+* changes at most 400 non-test lines (added plus deleted, documentation and lockfiles not counted); a binary source file
+  counts as over the limit;
+* changes no lockfile (by exact name, a full list, and any `*.lock`: a new dependency would need the network);
+* has no hunk inside code that `#[cfg(...)]` makes test-only: `test` as a token of the predicate (`all`, `any`, and not
+  under `not`), and a whole file under `#![cfg(test)]` (inline tests cannot be hidden).
+
+It writes `$BENCH_HOME/tasks/own-candidates.json` (commit, base, the hidden test files, a hint of the test command) and
+**never a statement**. You write it: [`bench/tasks/own/README.md`](tasks/own/README.md).
+
+**Lint.** `bench tasks lint` warns when an identifier (snake_case or camelCase) or a path that appears only in the gold
+change's added lines is in your statement. An `Interface` section is exempt: it is where the names the tests call belong.
+
+**Build, check, select.**
+
+* `bench tasks build` makes an own task's directory under `$BENCH_HOME/tasks/materialized` (the hidden tests read from the
+  clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
+  by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
+* `bench tasks check` (needs the Podman service) runs, per task, the gold patch three times and the empty patch three
+  times **from the clone path the agents will use**, not from `/app`: the base is cloned there, the top-level ignored
+  entries are linked to `/app`'s, and `test.sh` runs with `/app` rewritten to that path. A task is kept only if the gold
+  passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
+  `gold-flaky`, `gold-does-not-apply`, `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether
+  the base has a `.devcontainer`.
+* After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
+  the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+* `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
+  the task's checksum and image digest and is ignored when either has changed), draws them stratified by repository with the
+  seeded generator of `lib/stats.mjs` (public: 80, at most 9 per repository; own: 20, at most 6 per repository and at
+  most 6 from `selfRepo`) and writes the lock files. The same seed gives the same list.
+
+## Grading
+
+**A principle.** Grading runs the agent's code: its patched sources run inside the test process. So no grader can be
+made tamper-proof against code that runs inside it. The harness makes tampering hard and visible. It takes nothing
+from the agent's tree but its files, strips what may not change, demands that every signal agree, and lists every
+patch that touches the grading's own machinery as **suspect**, for a person to read. The report says so.
+
+`bench/lib/grade.mjs`:
+
+* **Collecting.** The agent's `.git` is never read or run (its `config`, filters, hooks and attributes can execute
+  commands). `collectPatch` clones the base from a repository the harness owns, copies the files of the agent's tree
+  over it (symlinks are copied as links and never followed, nested repositories are not entered), then runs
+  `git add -A` and `git diff --cached --binary <base>` with no system or global configuration, no hooks, no attributes
+  file, no fsmonitor and no textconv. Untracked files and binaries are included; the symlinks the adapter committed to
+  `/app/...` are left out; more than 5 MB stops with an error. The patch follows the **base's** `.gitignore`: the
+  agent's change to a `.gitignore` is dropped, and so are changes inside ignored paths or nested repositories.
+* **Stripping.** Before the patch is applied, every change to the hidden test files, to any path the miner calls a test
+  path (`tests/`, `*_test.*`, `tests.rs`, `testing/`, ...), to `conftest.py`, `pytest.ini`, `tox.ini`, `noxfile.py`,
+  jest, vitest, mocha and karma configuration and to `.gitattributes` is removed, and the removed paths are recorded with
+  the run. Changes to `pyproject.toml`, `setup.cfg`, `Cargo.toml`, `package.json` and `go.mod` that configure tests (a
+  `[tool.pytest*]` table, `[[test]]`, `harness`, a `test` script) are kept and flagged **suspect**.
+* **Grading.** The stripped patch is applied in a **new container of the task image, by digest**, `/tests` is mounted
+  **read-only in that container only**, `bash /tests/test.sh` runs, and the reward is read from a directory made empty
+  for that attempt, after the container has ended. A pass needs **all** of: exit status 0, a reward of exactly `1` written
+  during the attempt, and no error. A reward of `1` with another exit status is a fail and **suspect**. A patch whose added
+  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent
+  phase has no network; the grading container has the verifier's network.
+* **The verifier's network is an allow-list:** `none`, `default`, `public`, or a name in `tasks.verifierNetworks` of the
+  local configuration. `host` and anything else is refused, when the task is read and again when the container starts.
+* **Three attempts, two of three pass; a split is `flaky`.** An attempt that ends in an infrastructure error (exit 125,
+  126, 127, 98, or a timeout of the container) is tried again, at most twice; if it is still one the grade is **`invalid`**:
+  left out of the rates and listed in the report, never a fail. A patch that does not apply is a fail.
+* **Suspect list.** The report has a section with every suspect run: the reasons, what was stripped and the path of the
+  patch, for a person to read. A suspect run is graded as it is and counted as it is.
+
+The runtime is the `Containers` interface of `lib/containers.mjs`: `PodmanRemote` runs
+`podman --remote [--connection C | --url U] run --rm --pull=never --entrypoint sh ...` (the arguments are the pure
+function `buildRunArgs`) and `FakeContainers` is for tests. A mount source is a path as the Podman service sees it:
+the service and the harness must share the harness's work directory.
+
 ## Tests
 
 ```sh
-node --test "bench/test/*.test.mjs"     # about 110 tests, seconds, nothing beyond 127.0.0.1
+node --test "bench/test/*.test.mjs"     # about 200 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
 ```
 
-Tests that need Docker (pull requests 3 and 4) skip unless `BENCH_TEST_DOCKER=1` and fail under
-`BENCH_TEST_REQUIRE_DOCKER=1`. CI is `.github/workflows/bench.yml`, on changes under `bench/`.
+Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_TEST_REQUIRE_DOCKER=1`; today that is
+`bench/test/docker.test.mjs` (a self-made task: the oracle grades 1, the empty patch 0; it needs
+`BENCH_TEST_WORKSPACE_IMAGE`, a digest-named base image, and a Podman service that shares the temporary directory). CI is `.github/workflows/bench.yml`, on changes under `bench/`.
 
 ## Unverified
 
@@ -196,3 +333,14 @@ Tests that need Docker (pull requests 3 and 4) skip unless `BENCH_TEST_DOCKER=1`
 * That the meter's worst case is above every real call. If an endpoint reports more than the worst case, the global
   stop is what holds the cap.
 * The key-like test of the configuration is a heuristic.
+* *Verified 2026-11-17* (`scaleapi/SWE-bench_Pro-os`, `README.md` and `v2/README.md`): the task layout above and the
+  image names `ghcr.io/scaleapi/swe-bench_pro-v2:<instance_id>`. *Unverified:* where under `v2/` the task directories
+  and `SHA256SUMS` are (the harness finds any directory with a `task.toml` up to two levels deep and reads
+  `<upstreamDir>/SHA256SUMS`), the exact form of `SHA256SUMS`, and the form of `solution/` (the check needs a `*.patch`
+  there and drops a task without one as `no-gold-patch`).
+* Everything that needs a container service: `podman --remote` and its options as the Podman version in use takes them,
+  that a bind mount of a harness path works on the service, that `image inspect --format {{.Digest}}` gives the registry
+  digest of a pulled image and the manifest digest of a locally built one (and that a locally built image can then be
+  run as `name@sha256:...`), the clone-path check's `ln -s` of ignored entries (top level only) and its `sed` of
+  `/app` in `test.sh`, image sizes and pull speed.
+* That the miner's file classification (by path) matches your repositories' layouts.
