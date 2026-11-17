@@ -22,6 +22,20 @@ export const FALLBACKS = [
   'fallback 2: the coder\'s run pods on a k3d cluster (deploy/coder, RUN_ENVIRONMENT=kubernetes)',
 ];
 
+/**
+ * Does this Node's `http.request`/`https.request` (what the meter uses) take a proxy from the environment under NODE_USE_ENV_PROXY=1?
+ * *Verified 2026-11-17* in Node's changelogs (doc/changelogs/CHANGELOG_V24.md and CHANGELOG_V22.md, "http,https: add built-in proxy
+ * support in http/https.request and Agent", #58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20). `fetch()` has had it since
+ * 24.0.0, which is not what the meter uses.
+ */
+export function envProxyInRequest(version) {
+  const [major, minor] = version.split('.').map(Number);
+  if (major >= 25) return true;
+  if (major === 24) return minor >= 5;
+  if (major === 22) return minor >= 21;
+  return false;
+}
+
 const ok = (name, detail) => ({ name, status: 'ok', detail });
 const warn = (name, detail, fix) => ({ name, status: 'warn', detail, ...(fix ? { fix } : {}) });
 const fail = (name, detail, fix) => ({ name, status: 'fail', detail, ...(fix ? { fix } : {}) });
@@ -43,7 +57,7 @@ const readSysctl = (file, readFile) => {
  * @param {boolean} [o.start]
  * @returns {Promise<{checks: object[], exitCode: number, fallback: string|null}>}
  */
-export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2 }) {
+export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, env = process.env }) {
   const checks = [];
   const run = async (file, args) => {
     try {
@@ -54,7 +68,17 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   };
 
   const major = Number(nodeVersion.split('.')[0]);
-  checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (24 is what CI uses)'));
+  checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 22 and 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (CI runs 22 and 24)'));
+
+  // The meter reaches the endpoint with Node's own http client, which uses a proxy from the environment only when asked to.
+  const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+  if (proxy) {
+    if (!envProxyInRequest(nodeVersion)) {
+      checks.push(warn('proxy', `HTTPS_PROXY is set but Node ${nodeVersion}'s https.request ignores it, so the meter would reach the endpoint directly`, 'use Node 22.21.0 or newer, or 24.5.0 or newer, and start the harness with NODE_USE_ENV_PROXY=1'));
+    } else {
+      checks.push(env.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
+    }
+  }
 
   // The binary of OpenCode that is mounted is a native linux-x64 executable linked to glibc.
   checks.push(arch === 'x64' ? ok('machine', 'x64: the OpenCode binary of the pins runs here') : fail('machine', `${arch}: the OpenCode binary of the pins is linux-x64`, 'run the benchmark on an x64 Linux machine; a task image with musl (Alpine) cannot run it either, and the environment check says so'));

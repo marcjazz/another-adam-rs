@@ -1,5 +1,5 @@
 // One run, start to end, and a plan of runs with resume. This is the part of `pilot` and `run` the dry run needs:
-// sequential, one slot. Task blocks, several slots at once and the pilot's budget estimate are not here.
+// one run at a time (`runPlan`). Task blocks, several slots at once and the pilot's budget are schedule.mjs and budget.mjs.
 //
 //   Planned -> Reserved -> Preparing -> Running -> Collecting -> Grading -> Done
 //
@@ -40,6 +40,9 @@ export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${att
  * @property {object} config   the normalised configuration (its `limits` are the limits of a run)
  * @property {string} home     where this phase keeps its results
  * @property {(spec) => number} [reserveMicro]  what a run reserves; default the configuration's per-run budget
+ * @property {(slot: number, task) => Promise<void>} [pullImage]  makes the task's image present on the slot's service
+ * @property {(task) => Promise<void>} [pullGraderImage]  makes the task's image present on the grader (also before a grading again)
+ * @property {string} [digest]  the fingerprint of the configuration, written on every Planned record
  * @property {(run: string, state: string) => void} [afterState]  called after each state record is written
  */
 
@@ -56,9 +59,20 @@ async function gradeSaved({ deps, task, patchPath }) {
   const io = deps.stack.graderIO?.();
   const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work, ...(io ? { io } : {}) });
   const net = task.verifierNetwork;
-  // The grader has no route out; a verifier that needs the network gets it for the window of its grading.
-  return net === 'public' || net === 'default' ? deps.stack.graderWindow(grade) : grade();
+  await deps.pullGraderImage?.(task);
+  // The grader has no route out; a verifier that needs the network gets it for the window of its grading, alone on the grader.
+  if (net === 'public' || net === 'default') return deps.stack.graderWindow(grade);
+  return deps.stack.graderShared ? deps.stack.graderShared(grade) : grade();
 }
+
+/** The size of the saved patch, so a later regrade can tell that it is the one that was graded. */
+const patchBytes = (file) => {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return null;
+  }
+};
 
 function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes, meter }) {
   return {
@@ -73,6 +87,7 @@ function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes, meter }
     suspect: grade.suspect,
     removed: grade.removed,
     patch: patchPath,
+    patchBytes: patchBytes(patchPath),
     ...(notes ? { notes } : {}),
   };
 }
@@ -113,6 +128,7 @@ export async function executeRun({ deps, spec, attempt }) {
     stateRecord(deps, run, 'Preparing');
     // What an earlier run or a killed harness left in the slot's service is removed first, and checked.
     await containers.reapAll();
+    await deps.pullImage?.(spec.slot, task);
     await stack.resetWork(spec.slot);
     const base = await (deps.prepareBase ?? prepareBase)({ containers, stack, slot: spec.slot, task, hostRoot: path.join(paths.scratch, 'base') });
     const { token } = meter.openRun({ run, attempt, arm: spec.arm });
@@ -187,7 +203,7 @@ export async function executeRun({ deps, spec, attempt }) {
   else delete notes.refused;
   if (ran.record?.limits) notes.limits = ran.record.limits;
   const meterNote = { settled: stats.settled, upstreamErrors: stats.upstreamErrors, refused: stats.refused };
-  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes, meter: meterNote }, null, 2)}\n`);
+  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes, meter: meterNote, patchBytes: patchBytes(patchPath) }, null, 2)}\n`);
   await agent.cleanup(ctx).catch(() => {});
 
   stateRecord(deps, run, 'Grading');
@@ -206,38 +222,74 @@ export async function regradeRun({ deps, spec, attempt }) {
   } catch {
     // no meta: graded as an unknown exit
   }
-  const grade = await gradeSaved({ deps, task: spec.task, patchPath });
+  // A patch that is gone or is not the one that was saved would be graded as "no patch" and become a valid fail: the run is
+  // recorded invalid instead, and nothing is graded.
+  const bytes = patchBytes(patchPath);
+  const damaged = bytes === null || (Number.isSafeInteger(meta.patchBytes) && bytes !== meta.patchBytes);
+  const grade = damaged ? { pass: false, attempts: [], flaky: false, invalid: true, suspect: [], removed: [] } : await gradeSaved({ deps, task: spec.task, patchPath });
   stateRecord(deps, spec.run, 'Done', { result: resultOf({ grade, exit: meta.exit ?? 'unknown', wallMs: meta.wallMs, selfReported: meta.selfReported, patchPath, notes: meta.notes, meter: meta.meter }) });
   return { state: 'Done', pass: grade.pass };
 }
 
+/** Grade again a Done run whose grade is invalid (the grader failed, not the agent), from its saved patch. */
+export async function regradeInvalid({ deps, spec }) {
+  const view = deps.ledger.fold().get(spec.run);
+  if (view?.state !== 'Done' || view.result?.invalid !== true) return { run: spec.run, state: view?.state, skipped: true };
+  // A patch that is gone or changed would be graded as "no patch" and turn an invalid grade into a valid fail: left invalid.
+  const file = path.join(deps.home, 'runs', runDirName(spec.run, view.attempt), 'model.patch');
+  const bytes = patchBytes(file);
+  if (bytes === null || (Number.isSafeInteger(view.result.patchBytes) && bytes !== view.result.patchBytes)) {
+    return { run: spec.run, state: 'Done', skipped: true, reason: 'the saved patch is missing or is not the one that was graded' };
+  }
+  stateRecord(deps, spec.run, 'Grading', { regrade: true });
+  return { run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) };
+}
+
 /**
- * Bring the ledger to where a restart leaves it, then run what is left, in the order of `plan`.
- * `plan` is a list of { run, task, agent, arm, slot, block?, source?, language? }.
+ * Bring the ledger to where a restart leaves it: a run that was in flight is interrupted (its reservation is free, its
+ * spend stays), a retry is planned again, a Grading run re-enters Grading. Then every named slot is reaped, because a
+ * killed harness may have left a coder and the containers of a run in a service.
  */
-export async function runPlan({ deps, plan }) {
-  const { ledger } = deps;
-  const folded = ledger.fold();
+export async function resumeLedger({ deps, slots }) {
+  const folded = deps.ledger.fold();
   const actions = resumeActions(folded);
   for (const rec of resumeRecords(actions, folded)) {
     stateRecord(deps, rec.run, rec.state, Object.fromEntries(Object.entries(rec).filter(([k]) => !['kind', 'run', 'state'].includes(k))));
-    if (rec.state === 'Interrupted') deps.book.close(rec.run); // the killed attempt's reservation is free; its spend stays
+    if (rec.state === 'Interrupted') deps.book.close(rec.run);
   }
-  // A killed harness may have left a coder and the containers of a run in a service: reaped first (and again before each run).
-  for (const slot of new Set(plan.map((s) => s.slot))) {
-    await deps.stack.containers(slot).reapAll();
+  for (const slot of slots) await deps.stack.containers(slot).reapAll();
+  return actions;
+}
+
+/** Take one spec as far as the ledger says it should go: plan it if new, run it if Planned, grade it if Grading. */
+export async function advance({ deps, spec }) {
+  let view = deps.ledger.fold().get(spec.run);
+  if (!view) {
+    stateRecord(deps, spec.run, 'Planned', {
+      task: spec.task.id,
+      agent: spec.agent,
+      arm: spec.arm,
+      block: spec.block ?? null,
+      source: spec.source ?? spec.task.source ?? null,
+      language: spec.language ?? spec.task.language ?? null,
+      ...(deps.digest ? { digest: deps.digest } : {}),
+      ...(spec.phase ? { phase: spec.phase } : {}),
+    });
+    view = deps.ledger.fold().get(spec.run);
   }
+  if (view.state === 'Grading') return { run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) };
+  if (view.state === 'Planned') return { run: spec.run, ...(await executeRun({ deps, spec, attempt: view.attempt })) };
+  return { run: spec.run, state: view.state, skipped: true };
+}
+
+/**
+ * Bring the ledger to where a restart leaves it, then run what is left, one at a time, in the order of `plan`.
+ * `plan` is a list of { run, task, agent, arm, slot, block?, source?, language? }.
+ */
+export async function runPlan({ deps, plan }) {
+  await resumeLedger({ deps, slots: new Set(plan.map((s) => s.slot)) });
   const outcomes = [];
-  for (const spec of plan) {
-    let view = ledger.fold().get(spec.run);
-    if (!view) {
-      stateRecord(deps, spec.run, 'Planned', { task: spec.task.id, agent: spec.agent, arm: spec.arm, block: spec.block ?? null, source: spec.source ?? spec.task.source ?? null, language: spec.language ?? spec.task.language ?? null });
-      view = ledger.fold().get(spec.run);
-    }
-    if (view.state === 'Grading') outcomes.push({ run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) });
-    else if (view.state === 'Planned') outcomes.push({ run: spec.run, ...(await executeRun({ deps, spec, attempt: view.attempt })) });
-    else outcomes.push({ run: spec.run, state: view.state, skipped: true });
-  }
+  for (const spec of plan) outcomes.push(await advance({ deps, spec }));
   return outcomes;
 }
 

@@ -24,8 +24,8 @@ export const TRANSITIONS = {
   Grading: ['Grading', 'Done'],
   Interrupted: ['Planned', 'Failed_infra'],
   Failed_infra: ['Planned'],
-  Done: [],
-  NotStarted: [],
+  Done: ['Grading'], // only `bench regrade`, and only for a result that is `invalid` (an infrastructure error in grading)
+  NotStarted: ['Planned'], // a later start, with room under the cap, plans it again
   StoppedByCap: [],
 };
 
@@ -205,7 +205,16 @@ export class Ledger {
     this.now = now;
     this.fd = fs.openSync(file, 'a', 0o600);
     this.states = new Map();
-    for (const r of records) if (r.kind === 'state') this.states.set(r.run, r.state);
+    this.invalid = new Set();
+    for (const r of records) if (r.kind === 'state') this.#track(r);
+  }
+
+  #track(r) {
+    this.states.set(r.run, r.state);
+    if (r.state === 'Done') {
+      if (r.result?.invalid === true) this.invalid.add(r.run);
+      else this.invalid.delete(r.run);
+    }
   }
 
   /** Append one record, fsynced. A state record must follow the lifecycle. */
@@ -215,12 +224,15 @@ export class Ledger {
       const from = this.states.get(record.run);
       const allowed = from === undefined ? ['Planned'] : TRANSITIONS[from];
       if (!allowed.includes(record.state)) throw new LedgerError(`run ${record.run}: ${from ?? '(new)'} cannot become ${record.state}`);
+      if (from === 'Done' && !(record.regrade === true && this.invalid.has(record.run))) {
+        throw new LedgerError(`run ${record.run}: a Done run is graded again only when its grade is invalid, by a regrade`);
+      }
     }
     const stored = { v: 1, t: this.now().toISOString(), ...record };
     fs.writeSync(this.fd, `${JSON.stringify(stored)}\n`);
     fs.fsyncSync(this.fd);
     this.records.push(stored);
-    if (stored.kind === 'state') this.states.set(stored.run, stored.state);
+    if (stored.kind === 'state') this.#track(stored);
     return stored;
   }
 
@@ -272,6 +284,8 @@ export function foldRecords(records) {
         agent: null,
         arm: null,
         block: null,
+        digest: null,
+        phase: null,
         source: null,
         language: null,
         reservedMicro: 0,
@@ -299,7 +313,7 @@ export function foldRecords(records) {
       if (rec.state === 'Planned') {
         v.attempt += 1;
         v.attempts[v.attempt - 1] = newAttempt();
-        for (const f of ['task', 'agent', 'arm', 'block', 'source', 'language']) if (rec[f] !== undefined) v[f] = rec[f];
+        for (const f of ['task', 'agent', 'arm', 'block', 'source', 'language', 'digest', 'phase']) if (rec[f] !== undefined) v[f] = rec[f];
         v.result = null;
       }
       if (rec.state === 'Reserved') {
@@ -366,7 +380,8 @@ export function foldRecords(records) {
 
 /**
  * What to do with each run when the harness starts, from the fold alone.
- *   skip     Done, NotStarted, StoppedByCap: finished, never repeated
+ *   skip     Done, StoppedByCap: finished, never repeated
+ *   retry    NotStarted: the cap kept it from starting; a start with room plans it again
  *   plan     Planned: decide the reservation as for any new run
  *   rerun    Reserved, Preparing, Running, Collecting, Interrupted: start from scratch; the spend of
  *            the interrupted attempt stays in the ledger as wasted
@@ -382,9 +397,11 @@ export function resumeActions(folded, { maxInfraRetries = 2, maxInterruptions = 
     let reason;
     switch (v.state) {
       case 'Done':
-      case 'NotStarted':
       case 'StoppedByCap':
         action = 'skip';
+        break;
+      case 'NotStarted':
+        action = 'retry';
         break;
       case 'Planned':
         action = 'plan';
@@ -421,9 +438,9 @@ export function resumeRecords(actions, folded) {
       out.push({ kind: 'state', run: a.run, state: 'Failed_infra', final: true, reason: 'interrupted_too_often' });
     } else if (a.action === 'rerun') {
       if (IN_FLIGHT.has(a.from)) out.push({ kind: 'state', run: a.run, state: 'Interrupted', resumed: true });
-      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language });
+      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, digest: v.digest, phase: v.phase });
     } else if (a.action === 'retry') {
-      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language });
+      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, digest: v.digest, phase: v.phase });
     } else if (a.action === 'regrade') {
       out.push({ kind: 'state', run: a.run, state: 'Grading', regrade: true });
     }

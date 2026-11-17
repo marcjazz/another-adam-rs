@@ -25,6 +25,8 @@ export function createScriptedModel(initial = {}) {
     endless: false, // a stream that never ends: `endlessChunkBytes` of text every `endlessEveryMs`, honouring backpressure
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
+    holdBeforeDoneMs: 0, // the usage chunk is sent, then this long passes before `[DONE]` (a client that aborts in it aborts before the end)
+    holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
   };
   const requests = [];
@@ -101,8 +103,22 @@ export function createScriptedModel(initial = {}) {
             return timers.add(t);
           }
           if (behavior.endless) return endless();
+          if (behavior.holdBeforeDoneMs > 0 && !res.beforeDoneHeld) {
+            res.beforeDoneHeld = true;
+            const h = setTimeout(() => {
+              timers.delete(h);
+              next();
+            }, behavior.holdBeforeDoneMs);
+            return timers.add(h);
+          }
           res.write('data: [DONE]\n\n');
-          res.end();
+          if (behavior.holdAfterDoneMs > 0) {
+            const h = setTimeout(() => {
+              timers.delete(h);
+              res.end();
+            }, behavior.holdAfterDoneMs);
+            timers.add(h);
+          } else res.end();
         };
         const endless = () => {
           if (res.destroyed) return;

@@ -23,10 +23,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the shared system prompt is read from the adam file at the pinned revision
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node-version }}
       # A quoted glob: `node --test <directory>` is not read as a directory by every Node version.
       - run: node --test "bench/test/*.test.mjs"
