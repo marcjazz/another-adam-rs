@@ -225,9 +225,15 @@ pub(crate) fn estimate(
 /// Estimated tokens the request holds at least after a cut at `at` (characters / 4): the
 /// instructions and tools (`fixed_chars`), the task, which stays whole, and the messages from `at`.
 pub(crate) fn projected(messages: &[Message], at: usize, fixed_chars: usize) -> usize {
+    // The task stays whole: its first part, which is words, and the images the person sent with it.
     let task = match messages.first() {
         Some(Message::User { content }) => {
             content.first().map_or(0, |p| p.as_text().chars().count())
+                + content
+                    .iter()
+                    .filter(|p| matches!(p, ContentPart::Image(_)))
+                    .count()
+                    * crate::history::IMAGE_CHARS
         }
         _ => 0,
     };
@@ -377,6 +383,7 @@ pub(crate) fn facts_of(
                 call_id,
                 content,
                 is_error,
+                ..
             } if !is_error => {
                 if pinned_calls.contains(call_id) {
                     facts.pinned.push(bounded(content, PINNED_EACH_BYTES));
@@ -564,6 +571,17 @@ pub(crate) fn apply(
         _ => None,
     }
     .unwrap_or_else(|| ContentPart::text(""));
+    // The pictures that came with the task stay with it, after everything else of the message, so
+    // that the marker is still its second part. The pictures of the turns that are dropped are
+    // summarised away with their words.
+    let task_images: Vec<ContentPart> = match dropped.first() {
+        Some(Message::User { content }) => content
+            .iter()
+            .filter(|p| matches!(p, ContentPart::Image(_)))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
     state.compactions.push(Compaction {
         turn: state.turns,
         dropped_turns,
@@ -586,6 +604,7 @@ pub(crate) fn apply(
         )),
     ];
     parts.extend(sayings.into_iter().map(ContentPart::text));
+    parts.extend(task_images);
     let tail = state.messages.split_off(cut);
     state.pinned_calls.retain(|id| {
         tail.iter()

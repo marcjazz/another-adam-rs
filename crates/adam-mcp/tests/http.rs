@@ -1504,3 +1504,127 @@ async fn mcp_image_line_has_sha256() {
         described.content
     );
 }
+
+/// An image block of a result reaches a model that sees only when the deployment allows the source
+/// `mcp`; the text of a result for a model that cannot see (or a source that is not allowed) is
+/// exactly what it was, and nothing is kept.
+#[tokio::test]
+async fn an_image_block_reaches_a_seeing_model_only_from_an_allowed_source() {
+    use adam_mcp_testkit::PNG;
+    use adam_model::{ImageLimits, ImageOrigin};
+
+    let limits = |sources: &[ImageOrigin]| ImageLimits {
+        max_bytes: 1024 * 1024,
+        max_count: 8,
+        max_side: 4096,
+        sources: sources.iter().copied().collect(),
+    };
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("paint", &server.url(), "")).await;
+    let tools = servers.tools();
+    let tool = tools.get("paint__screenshot").unwrap();
+    let ctx = |limits: Option<ImageLimits>| {
+        let ctx = common::ctx("paint__screenshot");
+        match limits {
+            Some(limits) => ctx.with_image_limits(limits),
+            None => ctx,
+        }
+    };
+
+    // A model that cannot see: the text is what it always was.
+    let blind = tool.call(&ctx(None), json!({})).await.unwrap();
+    assert_eq!(blind.content, "[image not included: image/png]");
+    assert!(blind.images.is_empty() && blind.kept_images.is_empty());
+    // A source the deployment does not send (the default is the person and the workspace).
+    let closed = tool
+        .call(
+            &ctx(Some(limits(&[ImageOrigin::Person, ImageOrigin::Workspace]))),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.content, "[image not included: image/png]");
+    assert!(closed.images.is_empty());
+    // Allowed: the image rides on the result, the bytes for the run's state, and a line says so.
+    let open = tool
+        .call(&ctx(Some(limits(&[ImageOrigin::Mcp]))), json!({}))
+        .await
+        .unwrap();
+    assert!(!open.is_error, "{}", open.content);
+    assert_eq!(open.images.len(), 1);
+    assert_eq!(open.images[0].origin, ImageOrigin::Mcp);
+    assert_eq!(open.images[0].sha256, adam_llm_agent::sha256_hex(PNG));
+    assert_eq!(open.images[0].name.as_deref(), Some("screenshot-1.png"));
+    assert!(
+        open.content
+            .contains("[image shown to you after this result: screenshot-1.png (png, 67 bytes"),
+        "{}",
+        open.content
+    );
+    assert_eq!(open.kept_images.len(), 1);
+    // Over its limit: a stand-in line, and nothing rides.
+    let small = ImageLimits {
+        max_bytes: 10,
+        ..limits(&[ImageOrigin::Mcp])
+    };
+    let over = tool.call(&ctx(Some(small)), json!({})).await.unwrap();
+    assert!(over.images.is_empty());
+    assert!(
+        over.content.contains("[image not shown: screenshot-1.png"),
+        "{}",
+        over.content
+    );
+
+    // With `files: true` the image is also shared, as it always was, with the same SHA-256 on its
+    // line: the state keeps the bytes once, by that hash.
+    let shared = connect(&http_config("paint", &server.url(), r#""files": true"#)).await;
+    let both = shared
+        .tools()
+        .get("paint__screenshot")
+        .unwrap()
+        .call(&ctx(Some(limits(&[ImageOrigin::Mcp]))), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(both.artifacts.len(), 1);
+    assert_eq!(both.images.len(), 1);
+    assert_eq!(
+        both.artifacts[0].file_sha256().unwrap(),
+        both.images[0].sha256
+    );
+    assert_eq!(both.kept_images[0].sha256, both.images[0].sha256);
+    shared.shutdown().await;
+    servers.shutdown().await;
+}
+
+/// An image block over what one image may be is a line, and is not decoded: with the limit of the
+/// model far above it the line is still the cap's, and nothing is kept.
+#[tokio::test]
+async fn an_image_block_over_the_cap_is_a_line_and_is_never_decoded() {
+    use adam_model::{ImageLimits, ImageOrigin};
+
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("paint", &server.url(), "")).await;
+    let tools = servers.tools();
+    let tool = tools.get("paint__png").unwrap();
+    // Every limit of the model is above 5 MiB: only the cap of what one image may be says no.
+    let limits = ImageLimits {
+        max_bytes: 64 * 1024 * 1024,
+        max_count: 8,
+        max_side: 16_384,
+        sources: [ImageOrigin::Mcp].into(),
+    };
+    let at = adam_runtime::MAX_ARTIFACT_FILE_BYTES;
+    let ctx = || common::ctx("paint__png").with_image_limits(limits.clone());
+    let over = tool.call(&ctx(), json!({"bytes": at + 1})).await.unwrap();
+    assert!(over.images.is_empty() && over.kept_images.is_empty());
+    assert!(
+        over.content
+            .contains("image/png from `png` is over the 4 MiB one image may be"),
+        "{}",
+        over.content
+    );
+    // At the cap it is an image.
+    let fits = tool.call(&ctx(), json!({"bytes": at})).await.unwrap();
+    assert_eq!(fits.images.len(), 1, "{}", fits.content);
+    servers.shutdown().await;
+}

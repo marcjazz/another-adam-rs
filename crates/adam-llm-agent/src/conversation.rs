@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::compaction::{Compaction, CompactionReason, PromptSize};
+use crate::images::{InboundImage, KeptImage, StateImage};
 use crate::plan::Plan;
 use crate::source::ToolNote;
 
@@ -77,6 +78,8 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
         Value::String(s) => Ok(s.clone()),
         Value::Object(o) => match o.get("text") {
             Some(Value::String(s)) => Ok(s.clone()),
+            // A message that is only an image has no words.
+            None if !crate::images::parse_inbound_images(payload).is_empty() => Ok(String::new()),
             _ => Err("payload object has no string field \"text\"".into()),
         },
         _ => Err("payload must be {\"text\": \"...\"} or a JSON string".into()),
@@ -380,6 +383,32 @@ pub struct Conversation {
     /// of the call that kept a text journals it once more (in its result).
     #[serde(default, skip_serializing_if = "is_empty_map")]
     pub kept_outputs: Arc<BTreeMap<String, String>>,
+    /// The bytes of the images this run's history names, by SHA-256, **when the agent has no
+    /// [`ImageStore`](crate::ImageStore)** (an agent that is only a folder): base64, and counted
+    /// with [`kept_outputs`](Self::kept_outputs) against [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES),
+    /// so the worst-case state is what it was. An agent with a store has none here: the state holds
+    /// references only. A run that continues another carries the ones its carried history still
+    /// names. Absent from state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "is_empty_images")]
+    pub images: Arc<BTreeMap<String, StateImage>>,
+    /// The images of the message that started the run, until the first step admits them (the start
+    /// of a run is synchronous and cannot keep a file). At most
+    /// [`MAX_INBOUND_IMAGES`](crate::MAX_INBOUND_IMAGES) and
+    /// [`MAX_INBOUND_IMAGE_BYTES`](crate::MAX_INBOUND_IMAGE_BYTES), once, in one state. Absent from
+    /// state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_images: Vec<InboundImage>,
+    /// The SHA-256 of the images that a model request carried and the provider took: the ones the
+    /// history names and that a refusal of a later request is therefore not blamed on. Absent from
+    /// state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub sent_images: std::collections::BTreeSet<String>,
+    /// The bytes of images that the tool steps of this run journaled, for an agent with no image
+    /// store. Never freed: what was journaled stays journaled. Bounded by
+    /// [`MAX_RUN_JOURNALED_IMAGE_BYTES`](crate::MAX_RUN_JOURNALED_IMAGE_BYTES). Absent from state
+    /// written before it existed, and not written while 0.
+    #[serde(default, skip_serializing_if = "is_zero_bytes")]
+    pub journaled_image_bytes: usize,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
     /// [`pending_wait`](Self::pending_wait).
@@ -998,9 +1027,121 @@ impl Conversation {
         }
     }
 
-    /// The bytes of the outputs the run keeps in its own state.
+    /// The bytes the run keeps in its own state: its kept outputs and its images (what
+    /// [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES) bounds).
     pub fn kept_bytes(&self) -> usize {
-        self.kept_outputs.values().map(String::len).sum()
+        self.kept_outputs.values().map(String::len).sum::<usize>()
+            + self
+                .images
+                .values()
+                .map(|image| image.data.len() / 4 * 3)
+                .sum::<usize>()
+    }
+
+    /// The images the history holds: the image parts of its messages, the ones still waiting
+    /// behind an owed tool result, and the images of its tool results. What the model is sent each
+    /// request, and what [`MODEL_IMAGE_MAX_COUNT`](crate::ImageGate) bounds.
+    pub fn image_count(&self) -> usize {
+        self.messages
+            .iter()
+            .chain(&self.deferred)
+            .map(|m| m.images().len())
+            .sum()
+    }
+
+    /// Keep the bytes of the images a call asked the run to keep, if they fit the room the run has:
+    /// the call was told its room, so an image over it was never offered.
+    pub(crate) fn keep_images(&mut self, kept: Vec<KeptImage>) {
+        for image in kept {
+            if self.kept_bytes() + image.data.len() / 4 * 3 <= crate::kept::MAX_RUN_KEPT_BYTES {
+                Arc::make_mut(&mut self.images).insert(
+                    image.sha256,
+                    StateImage {
+                        media_type: image.media_type,
+                        data: image.data,
+                    },
+                );
+            }
+        }
+    }
+
+    /// What a tool step kept in the run's state: counted as journaled (the step's result holds the
+    /// bytes, offered or not), then kept as [`keep_images`](Self::keep_images) says.
+    pub(crate) fn keep_tool_images(&mut self, kept: Vec<KeptImage>) {
+        self.journaled_image_bytes = self
+            .journaled_image_bytes
+            .saturating_add(kept.iter().map(|i| i.data.len() / 4 * 3).sum::<usize>());
+        self.keep_images(kept);
+    }
+
+    /// The provider took a request that carried the images `sent`: they are not to blame for a later
+    /// refusal. Only images the history still names are remembered.
+    pub(crate) fn note_images_sent(&mut self, sent: Vec<String>) {
+        if sent.is_empty() {
+            return;
+        }
+        self.sent_images.extend(sent);
+        let named: std::collections::BTreeSet<String> = self
+            .messages
+            .iter()
+            .chain(&self.deferred)
+            .flat_map(Message::images)
+            .map(|image| image.sha256.clone())
+            .collect();
+        self.sent_images.retain(|sha| named.contains(sha));
+    }
+
+    /// Replace the images of a request that no successful request carried (`carried` names the ones
+    /// this request did) with the line `say` gives for each, and say whether there was one. The
+    /// bytes the run kept for them go.
+    pub(crate) fn replace_unsent_images(
+        &mut self,
+        carried: &[String],
+        say: &dyn Fn(&adam_model::ImageRef) -> String,
+    ) -> bool {
+        let named: std::collections::BTreeSet<&str> = self
+            .messages
+            .iter()
+            .chain(&self.deferred)
+            .flat_map(Message::images)
+            .map(|image| image.sha256.as_str())
+            .collect();
+        let fresh: std::collections::BTreeSet<String> = carried
+            .iter()
+            .filter(|sha| !self.sent_images.contains(*sha) && named.contains(sha.as_str()))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return false;
+        }
+        let swap = |image: &adam_model::ImageRef| fresh.contains(&image.sha256).then(|| say(image));
+        crate::images::rewrite_images(&mut self.messages, &swap);
+        crate::images::rewrite_images(&mut self.deferred, &swap);
+        self.drop_unnamed_images();
+        true
+    }
+
+    /// Forget the state-kept images that no message names any more.
+    pub(crate) fn drop_unnamed_images(&mut self) {
+        if self.images.is_empty() {
+            return;
+        }
+        let named: std::collections::BTreeSet<&str> = self
+            .messages
+            .iter()
+            .chain(&self.deferred)
+            .flat_map(Message::images)
+            .map(|image| image.sha256.as_str())
+            .collect();
+        if self.images.keys().any(|sha| !named.contains(sha.as_str())) {
+            let keep: BTreeMap<String, StateImage> = self
+                .images
+                .iter()
+                .filter(|(sha, _)| named.contains(sha.as_str()))
+                .map(|(sha, image)| (sha.clone(), image.clone()))
+                .collect();
+            self.images = Arc::new(keep);
+        }
     }
 
     fn continued_within(&self, text: impl Into<String>, from: RunId, cap: usize) -> Self {
@@ -1027,18 +1168,217 @@ impl Conversation {
                 .into_iter()
                 .collect(),
             pinned_calls: self.pinned_calls.clone(),
+            images: Arc::clone(&self.images),
+            sent_images: self.sent_images.clone(),
             ..Self::default()
         }
+        .with_unnamed_images_dropped()
     }
+
+    fn with_unnamed_images_dropped(mut self) -> Self {
+        self.drop_unnamed_images();
+        self
+    }
+}
+
+fn is_zero_bytes(n: &usize) -> bool {
+    *n == 0
 }
 
 fn is_empty_map(map: &Arc<BTreeMap<String, String>>) -> bool {
     map.is_empty()
 }
 
+fn is_empty_images(map: &Arc<BTreeMap<String, StateImage>>) -> bool {
+    map.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shot(sha: &str) -> adam_model::ImageRef {
+        adam_model::ImageRef {
+            sha256: sha.repeat(64),
+            media_type: "image/png".into(),
+            bytes: 10,
+            width: 8,
+            height: 8,
+            name: Some(format!("{sha}.png")),
+            origin: adam_model::ImageOrigin::Person,
+        }
+    }
+
+    /// A state image of `bytes` bytes (a multiple of 3, so that base64 has no padding).
+    fn held(bytes: usize) -> StateImage {
+        use base64::Engine as _;
+        assert_eq!(bytes % 3, 0);
+        StateImage {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![7u8; bytes]),
+        }
+    }
+
+    fn with_images(shas: &[&str]) -> Conversation {
+        let mut state = Conversation::new("look");
+        Arc::make_mut(&mut state.images).extend(shas.iter().map(|s| (s.repeat(64), held(30))));
+        state
+    }
+
+    /// What the run keeps in its state counts the images, so a long result sees less room.
+    #[test]
+    fn the_bytes_of_state_images_count_against_the_bound() {
+        let mut state = Conversation::new("x");
+        Arc::make_mut(&mut state.images).insert("a".repeat(64), held(3000));
+        Arc::make_mut(&mut state.kept_outputs).insert("o-0123456789abcdef".into(), "12345".into());
+        assert_eq!(state.kept_bytes(), 3005);
+    }
+
+    /// The state takes an image only while the run's room holds it.
+    #[test]
+    fn the_state_keeps_no_image_past_the_bound() {
+        // The most the state may hold, in whole base64 groups.
+        let room = crate::kept::MAX_RUN_KEPT_BYTES / 3 * 3;
+        let mut state = Conversation::new("x");
+        Arc::make_mut(&mut state.images).insert("a".repeat(64), held(room - 30));
+        let kept = |sha: &str, bytes: usize| KeptImage {
+            sha256: sha.repeat(64),
+            media_type: "image/png".into(),
+            data: held(bytes).data,
+        };
+        state.keep_images(vec![kept("b", 60)]);
+        assert_eq!(state.images.len(), 1, "an image over the room is not kept");
+        state.keep_images(vec![kept("c", 30)]);
+        assert_eq!(state.images.len(), 2);
+        assert_eq!(state.kept_bytes(), room);
+        // At the bound, one image more than fits is not kept.
+        state.keep_images(vec![kept("d", 3)]);
+        assert_eq!(state.images.len(), 2, "{}", state.kept_bytes());
+    }
+
+    /// Bytes are kept for the images a message names, a deferred one included, and for no other.
+    #[test]
+    fn the_state_forgets_the_images_no_message_names() {
+        let mut state = with_images(&["a", "b", "c"]);
+        state
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        state
+            .deferred
+            .push(Message::user_with_images("later", vec![shot("b")]));
+        state.drop_unnamed_images();
+        let kept: Vec<&String> = state.images.keys().collect();
+        assert_eq!(kept, [&"a".repeat(64), &"b".repeat(64)]);
+    }
+
+    /// A continued run carries the bytes of the images its carried history names, and no others.
+    #[test]
+    fn a_continued_run_keeps_the_bytes_of_the_images_it_carries() {
+        let mut prior = with_images(&["a", "b", "c"]);
+        prior
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        prior.messages.push(Message::assistant_text("seen"));
+        prior
+            .deferred
+            .push(Message::user_with_images("later", vec![shot("b")]));
+        let next = prior.continued("and now", RunId::new());
+        let kept: Vec<&String> = next.images.keys().collect();
+        assert_eq!(kept, [&"a".repeat(64), &"b".repeat(64)]);
+        assert_eq!(next.image_count(), 2);
+        assert_eq!(prior.images.len(), 3, "the prior run is not changed");
+    }
+
+    /// The count of images is the history's: its messages and the ones deferred behind a result.
+    #[test]
+    fn the_image_count_includes_the_deferred_messages() {
+        let mut state = Conversation::new("x");
+        state
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        state.messages.push(Message::tool_result_with_images(
+            "c1",
+            "seen",
+            vec![shot("b"), shot("c")],
+        ));
+        assert_eq!(state.image_count(), 3);
+        state
+            .deferred
+            .push(Message::user_with_images("later", vec![shot("d")]));
+        assert_eq!(state.image_count(), 4);
+    }
+
+    /// What a tool step journals is counted for good, offered or not, kept or not.
+    #[test]
+    fn journaled_image_bytes_are_counted_and_never_freed() {
+        let mut state = Conversation::new("x");
+        let kept = |sha: &str, bytes: usize| KeptImage {
+            sha256: sha.repeat(64),
+            media_type: "image/png".into(),
+            data: held(bytes).data,
+        };
+        state.keep_tool_images(vec![kept("a", 300), kept("b", 600)]);
+        assert_eq!(state.journaled_image_bytes, 900);
+        // Dropping the bytes from the state does not give them back.
+        state.drop_unnamed_images();
+        assert!(state.images.is_empty());
+        assert_eq!(state.journaled_image_bytes, 900);
+        state.keep_tool_images(vec![kept("c", 99)]);
+        assert_eq!(state.journaled_image_bytes, 999);
+    }
+
+    /// An image no successful request carried is replaced by a line, once; one that was carried is
+    /// not touched; with none the answer is no.
+    #[test]
+    fn only_images_no_request_carried_are_replaced() {
+        let mut state = with_images(&["a", "b"]);
+        state
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        state.messages.push(Message::tool_result_with_images(
+            "c1",
+            "seen",
+            vec![shot("b")],
+        ));
+        let (first, last) = (1, 2);
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        state.note_images_sent(vec![a.clone()]);
+        assert!(state.sent_images.contains(&a));
+        let say = |image: &adam_model::ImageRef| format!("[gone: {}]", image.sha256.len());
+        // The request carried both; only `b` is new.
+        assert!(state.replace_unsent_images(&[a.clone(), b.clone()], &say));
+        assert_eq!(
+            state.messages[first].images().len(),
+            1,
+            "carried before: kept"
+        );
+        assert!(state.messages[last].images().is_empty());
+        assert!(state.messages[last].text().ends_with("[gone: 64]"));
+        assert_eq!(state.images.keys().collect::<Vec<_>>(), [&a]);
+        // Nothing new is left: no.
+        assert!(!state.replace_unsent_images(&[a.clone(), b], &say));
+        // An image the request did not carry is never blamed.
+        let mut other = with_images(&["a"]);
+        other
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        assert!(!other.replace_unsent_images(&[], &say));
+        assert_eq!(other.messages[1].images().len(), 1);
+    }
+
+    /// Only the images the history still names are remembered as sent.
+    #[test]
+    fn sent_images_are_remembered_only_while_named() {
+        let mut state = Conversation::new("x");
+        state
+            .messages
+            .push(Message::user_with_images("one", vec![shot("a")]));
+        state.note_images_sent(vec!["a".repeat(64), "z".repeat(64)]);
+        assert_eq!(state.sent_images.len(), 1);
+        assert!(state.sent_images.contains(&"a".repeat(64)));
+        let carried = state.continued("next", RunId::new());
+        assert_eq!(carried.sent_images, state.sent_images);
+    }
 
     /// A continuing task starts with no kept output: its history names ids it cannot read.
     #[test]

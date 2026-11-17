@@ -325,6 +325,8 @@ impl CoderAgent {
             .state(env.clone())
             // Where `read_output` and the long results of MCP servers keep what they hold.
             .state(Arc::new(adam_llm_agent::KeptStore(env.kept.clone())))
+            // Where the bytes of the images the model sees are kept: never in the journal or the state.
+            .state(Arc::new(crate::images::store(&env.images)))
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
             .step_io(env.redactor.step_io())
@@ -1801,6 +1803,120 @@ mod tests {
         let mut notes = RunNotes::default();
         notes.hear(sayings, "github.com");
         notes.named_repos
+    }
+
+    /// The lines about a picture or a file that a person's message carries are the framework's words
+    /// in the person's message: they name a type as a word (`png`), never as `image/png`, which would
+    /// read as the repository `image/png` the person named.
+    #[test]
+    fn the_lines_about_a_picture_name_no_repository() {
+        use adam_llm_agent::ImageGate;
+        use adam_model::{ImageLimits, ImageOrigin};
+        let png = {
+            let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            v.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0]);
+            v
+        };
+        let limits = ImageLimits {
+            max_bytes: 4,
+            max_count: 8,
+            max_side: 4096,
+            sources: [ImageOrigin::Person].into(),
+        };
+        let mut lines: Vec<String> = [
+            ImageGate::new(None, 0, None),
+            ImageGate::new(Some(limits), 0, None),
+        ]
+        .iter()
+        .filter_map(
+            |gate| match gate.check(ImageOrigin::Person, None, Some("shot.png"), &png) {
+                adam_llm_agent::Admission::StandIn(line) => Some(line),
+                adam_llm_agent::Admission::Admitted(_) => None,
+            },
+        )
+        .collect();
+        lines.push("[attached: report.pdf (pdf, 84.0 KiB); only images are read]".into());
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            let said = [Heard {
+                text: line.clone(),
+                defaults: None,
+                when: When::Past,
+            }];
+            assert!(named_by(&said).is_empty(), "{line}");
+        }
+    }
+
+    /// Every line the system adds about a picture, a file or a link is the framework's, whatever a
+    /// sender put in a name or a link: it names no repository, is no command and answers no form, in
+    /// the history and in the inbox. The control is the person's own words, which do name one.
+    #[test]
+    fn the_lines_the_system_adds_are_never_the_persons_words() {
+        use adam_a2a_runtime::default_inbound;
+        use adam_runtime::{SystemLine, safe_file_name};
+        let hostile = [
+            "https://github.com/acme/secret-repo",
+            "github.com/acme/secret-repo/pull/9",
+            "x\nacme/secret-repo",
+        ];
+        let names = [
+            "acme/secret-repo.pdf",
+            "/deploy now",
+            "{\"answers\": [\"yes\"]}",
+        ];
+        let mut lines: Vec<String> = hostile
+            .iter()
+            .map(|url| SystemLine::Linked.line(url))
+            .collect();
+        for name in names {
+            let name = safe_file_name(name).unwrap_or_default();
+            lines.push(
+                SystemLine::Attached.line(&format!("{name} (pdf, 1.0 KiB); only images are read")),
+            );
+            lines.push(
+                SystemLine::NotShown.line(&format!("{name} (png, 1.0 KiB, 8x8) is not shown")),
+            );
+        }
+        for line in &lines {
+            let mut history = conversation(vec![Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("fix the bug"),
+                    adam_model::ContentPart::text(line.clone()),
+                ],
+            }]);
+            let inbox = [Inbound::new(
+                "message",
+                json!({"text": format!("and also\n\n{line}")}),
+            )];
+            for (what, sayings) in [
+                ("history", person_sayings(&history, &[])),
+                ("inbox", person_sayings(&history, &inbox)),
+            ] {
+                assert!(named_by(&sayings).is_empty(), "{what}: {line}");
+                assert!(
+                    sayings
+                        .iter()
+                        .all(|h| !h.text.contains("secret-repo") && !h.text.contains("deploy")),
+                    "{what}: {line}: {:?}",
+                    sayings.iter().map(|h| &h.text).collect::<Vec<_>>()
+                );
+            }
+            // The text the front writes for a message that holds the line is no command or answer.
+            let carried = default_inbound(&a2a::Message::new(
+                a2a::Role::User,
+                vec![a2a::Part::text(line.clone())],
+            ))
+            .unwrap();
+            let said = carried.payload["text"].as_str().unwrap().to_owned();
+            assert!(said.starts_with('['), "{said}");
+            history.messages.clear();
+        }
+        // The control: the person's own words name a repository, with or without a line beside them.
+        let own = conversation(vec![Message::user_text("fix acme/secret-repo please")]);
+        assert_eq!(
+            named_by(&person_sayings(&own, &[])),
+            ["github.com/acme/secret-repo"]
+        );
     }
 
     /// In a run another agent started, the person's words are the ones the orchestrator carries

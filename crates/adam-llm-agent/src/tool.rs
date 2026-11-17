@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
-use adam_model::ToolSpec;
+use adam_model::{ImageRef, ToolSpec};
 use adam_runtime::{
     Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, Inbound, MAX_RUN_FILE_BYTES,
     RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
 use crate::plan::Plan;
 use crate::source::ToolNote;
@@ -406,6 +407,27 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while it is `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Images the result returns, by reference: [`keep_image`](crate::keep_image) admits and keeps
+    /// them, [`with_image`](Self::with_image) adds one. The history holds them on the tool's message,
+    /// and a model that sees is sent them after the run of tool messages; the references hold no
+    /// byte. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
+    /// The bytes of [`images`](Self::images), for the run to keep **in its own state**: only when
+    /// the agent has no [`ImageStore`](crate::ImageStore) ([`keep_image`](crate::keep_image) says
+    /// which). Journaled with the result, like [`kept`](Self::kept), so a replay keeps the same
+    /// images.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "no_kept_images")]
+    pub kept_images: Box<[KeptImage]>,
+}
+
+/// `kept_images` is a boxed slice, which keeps a [`ToolOutput`] small: most results return none.
+fn no_kept_images(kept: &[KeptImage]) -> bool {
+    kept.is_empty()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -427,6 +449,8 @@ impl ToolOutput {
             kept: None,
             reported: Vec::new(),
             pinned: false,
+            images: Vec::new(),
+            kept_images: Box::default(),
         }
     }
 
@@ -445,7 +469,22 @@ impl ToolOutput {
             kept: None,
             reported: Vec::new(),
             pinned: false,
+            images: Vec::new(),
+            kept_images: Box::default(),
         }
+    }
+
+    /// Add the image `outcome` admitted ([`keep_image`](crate::keep_image)) to the result. An image
+    /// that was not admitted adds nothing: its line is `ImageOutcome::stand_in`, for the text.
+    #[must_use]
+    pub fn with_image(mut self, outcome: ImageOutcome) -> Self {
+        self.images.extend(outcome.image);
+        if let Some(kept) = outcome.kept {
+            let mut all = std::mem::take(&mut self.kept_images).into_vec();
+            all.push(*kept);
+            self.kept_images = all.into_boxed_slice();
+        }
+        self
     }
 
     /// Announce `text` as the run's answer: once the run finishes, `text` is what it answered, and
@@ -693,14 +732,18 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
-    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)).
-    kept_left: usize,
+    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)). Shared by
+    /// the clones of the context and spent by whatever the call keeps there, an image included.
+    kept_left: Arc<std::sync::atomic::AtomicUsize>,
     /// The outputs the run keeps in its own state ([`kept_text`](Self::kept_text)).
     kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
     scrub: Option<Scrubber>,
+    /// What the call needs to admit images ([`keep_image`](crate::keep_image)); `None` for a
+    /// detached context, which admits none.
+    images: Option<Arc<ImagePolicy>>,
 }
 
 /// A function from a text to the same text with its secrets replaced.
@@ -752,9 +795,61 @@ impl ToolCtx {
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
-            kept_left: 0,
+            kept_left: Arc::default(),
             kept: Arc::default(),
+            images: None,
         }
+    }
+
+    /// Say how the run admits images: the gate for the model, the conversation's scope for the
+    /// keeper, and the keeper in the agent's state. The agent loop does it for every call.
+    #[must_use]
+    pub(crate) fn with_images(mut self, gate: ImageGate, scope: String, root_run: String) -> Self {
+        let store = self.state::<ImageStore>().map(|s| (*s).clone());
+        self.images = Some(Arc::new(ImagePolicy {
+            gate: std::sync::Mutex::new(gate),
+            store,
+            scope,
+            root_run,
+        }));
+        self
+    }
+
+    /// Say that the model of the call sees images within `limits`, with an empty history and no room
+    /// to count in a run's state: for a context made outside a run (a test of a tool that offers
+    /// images, [`keep_image`](crate::keep_image)). The agent loop does the same for every call, from
+    /// the model's own word and what the history holds.
+    #[must_use]
+    pub fn with_image_limits(self, limits: adam_model::ImageLimits) -> Self {
+        let root = self.root_run.to_string();
+        let scope = crate::images::image_scope(None, &root);
+        self.with_images(ImageGate::new(Some(limits), 0, None), scope, root)
+    }
+
+    /// Whether the model of this run can see images at all: a tool that would read or fetch an
+    /// image only to have it replaced by a line may say so instead, and not read it.
+    pub fn sees_images(&self) -> bool {
+        self.images.as_ref().is_some_and(|p| {
+            p.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sees()
+        })
+    }
+
+    /// Whether the model sees images that come from `origin`: it sees them and the deployment
+    /// sends that source.
+    pub fn sees_images_from(&self, origin: adam_model::ImageOrigin) -> bool {
+        self.images.as_ref().is_some_and(|p| {
+            p.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sees_from(origin)
+        })
+    }
+
+    pub(crate) fn image_policy(&self) -> Option<&ImagePolicy> {
+        self.images.as_deref()
     }
 
     /// Give the call a function that scrubs secrets out of a text. A layer that scrubs the results
@@ -829,7 +924,7 @@ impl ToolCtx {
     /// every call.
     #[must_use]
     pub fn with_kept(mut self, left: usize, kept: Arc<BTreeMap<String, String>>) -> Self {
-        self.kept_left = left;
+        self.kept_left = Arc::new(std::sync::atomic::AtomicUsize::new(left));
         self.kept = kept;
         self
     }
@@ -837,7 +932,21 @@ impl ToolCtx {
     /// The bytes a tool may still hand back in [`ToolOutput::kept`]: [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES)
     /// less what the run keeps already (none for a detached context).
     pub fn kept_left(&self) -> usize {
-        self.kept_left
+        self.kept_left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `bytes` of the room were used: what a call keeps takes from what it may still keep.
+    pub(crate) fn spend_kept(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99 and its
+        // replacement is newer than the minimum version this workspace builds with.
+        let mut left = self.kept_left.load(SeqCst);
+        while let Err(now) =
+            self.kept_left
+                .compare_exchange_weak(left, left.saturating_sub(bytes), SeqCst, SeqCst)
+        {
+            left = now;
+        }
     }
 
     /// The text the run keeps under the output id `id` in its own state.
