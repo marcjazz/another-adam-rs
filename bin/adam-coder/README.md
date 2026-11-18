@@ -1885,7 +1885,9 @@ middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var
 uses, or a `tools:` name the coder does not register. Then update `tests/fixtures/agent/prompt.txt` (the
 **instruction snapshot**: the body of `instructions.md`, placeholders as written) and `card.json` in the same commit:
 a change of what the model is told is a reviewed diff of those files, a change of behaviour to decide on and not
-a refactor (see [Tests](#tests)). The limit in the prompt follows
+a refactor (see [Tests](#tests)). The rendered body is under the loader's 30,000 characters by about 250 (the count
+varies a few characters with the check limits): a sentence added needs an equal length cut, and
+`the_prompt_names_no_opencode_and_stays_under_30000_chars` says when it does not. The limit in the prompt follows
 `MAX_CHECK_CYCLES` and `SCRATCH_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` and
 `scratch_check_cycles` as the vars, so the file's defaults only apply to a caller that does not.
 
@@ -2062,6 +2064,18 @@ shipped files stay in the binary and cannot disagree with it.
     a run's code is *given* on purpose (a file the model reads) is as exposed as that act.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
   `adam-assembly/tests/extra_mcp.rs`, `adam-mcp/tests/http.rs` (`an_optional_server_*`).
+
+### Calls at the same time
+
+The calls of one model reply run at the same time (`MAX_PARALLEL_TOOL_CALLS`, 10 by default). Each tool declares what
+its call shares with the others: `tools/access.rs` names the scopes (`files`, `commands`, `lsp`) and the classes with
+two uses, and `#[tool(parallel = "read" | "write" | "exclusive", path = "path")]` the rest. The list, and why the gates
+run alone, is in [the reference](../../docs/reference/coder-agent.md#calls-at-the-same-time); `tests/tool_access.rs`
+holds it. `NotesStore::update` is how a call changes the run's notes (a lock per run around load, change and save);
+`run_checks`, `commit_and_push` and `open_pull_request` run alone and read the notes once and write them once.
+`write_file` and `edit_file` rename a new file over the old, so a read beside them sees one whole file.
+Tests: `tests/tool_access.rs`, `concurrent_updates_of_one_run_keep_every_change` in `src/tools/notes.rs`,
+`a_read_beside_a_write_or_an_edit_sees_a_whole_file` in `src/tools/files.rs`.
 
 ### Retry safety
 

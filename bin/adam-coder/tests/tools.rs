@@ -5129,6 +5129,41 @@ fn shared(out: &ToolOutput) -> (String, String, String, Vec<u8>) {
     )
 }
 
+/// `share_file` runs beside the other calls of its turn (ADR 0049): files shared by calls at the
+/// same time are all in the notes, each recorded in one step (`NotesStore::update`).
+#[tokio::test]
+async fn files_shared_at_the_same_time_are_all_noted() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let names: Vec<String> = (0..6).map(|n| format!("out/f{n}.svg")).collect();
+    for name in &names {
+        WriteFile
+            .call(
+                &rig.ctx,
+                json!({"path": name, "content": String::from_utf8_lossy(SVG)}),
+            )
+            .await
+            .unwrap();
+    }
+    let shares = names
+        .iter()
+        .map(|name| ShareFile.call(&rig.ctx, json!({"path": name})));
+    for out in futures::future::join_all(shares).await {
+        assert!(!out.unwrap().is_error);
+    }
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    let mut shared = notes.shared.clone();
+    shared.sort();
+    let expected: Vec<String> = names.iter().map(|n| format!("remote/{n}")).collect();
+    assert_eq!(shared, expected);
+}
+
 #[tokio::test]
 async fn share_file_needs_a_workspace_like_the_others() {
     let rig = Rig::new().await;
@@ -7108,6 +7143,12 @@ async fn a_run_is_shown_at_most_32_nested_files_and_is_told_once() {
         "Further project instruction files exist below the root and are not shown (a run is shown \
          32): read them with read_file.\n\n     1\tf\n[end: 1 lines]"
     );
+    // The same call again (a retry): the same line.
+    let retry = ReadFile
+        .call(&rig.ctx, json!({"path": "d32/f.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(retry.content, note.content);
     // Another call says nothing more.
     let later = later_call(&rig, "call-2").await;
     let out = ReadFile
