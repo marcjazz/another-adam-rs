@@ -114,7 +114,7 @@ at once, or "interrupted" answers (adam replays).
     agrees, and a test catches the bug.
 12. **Sync on demand** is a reserved optional boolean argument, `after_previous`, injected into every schema when the limit is
     above 1 and stripped before the tool, `Tool::access`, `call_key`, hooks and the step's input see the call. A call with it
-    is a barrier. Slice P6 builds it; a one-sentence addition to the instructions says what it means. Alternatives weighed:
+    is a barrier. Slice P6 built it: a one-sentence addition to the instructions says what it means. A bad value answers an error and the call takes no step; a tool whose own schema has the name keeps it (an own tool of the agent is a `BuildError::ReservedArgument`, a source's tool is left alone and logged); the flag is kept in the state with the turn's pending calls, and the names of the tools that have one of their own in the recorded model answer, so a replay does not depend on the sources. Alternatives weighed:
     `after: [index]` (positions are error-prone for models, and needs cycle checks), a wrapper `run_in_order { calls }` (inner
     arguments no schema validates, one result for many calls), and a barrier tool `then {}` (a meaningless call and result in
     the history). The fallback if the extra tokens (an estimate: 300 to 400 per request for about 40 tools) matter is `then {}`.
@@ -192,9 +192,7 @@ stateDiagram-v2
 * **Additive:** `Tool::access`, `ToolSource::access`, `ToolAccess`, `Use`, `UseMode`, the `#[tool]` options,
   `FnTool::with_access`, `Ctx::reserve_steps`, `ReservedStep`, `Ctx::step_all`, `LlmAgentBuilder::max_parallel`
   (slice P4), and later `NotesStore::update`.
-* **Not additive, in later slices:** `adam_agent_fs::Limits` gains `max_parallel` (a struct literal breaks); the `adam-service`
-  `Config` and the MCP server config gain a field; the MCP tool calls of every folder agent now run concurrently; the prompt
-  prefix changes once; the chart renders a new key. Say each in the pull request and in `adam-upgrade`.
+* **Not additive, built in P5 to P7:** `adam_agent_fs::Limits` gained `max_parallel` and `McpSettings` gained `parallel`; `adam_service::WorkerSettings`, `adam_agent::WorkerParts` (and `assemble_with` now delegates to `assemble_limited`) and adam-coder's `WorkerConfig` and `CoderSettings` gained a field; `BuildError` gained the variant `ReservedArgument`; `Conversation` gained `ordered_calls` (emptied once the turn's calls are answered); `Tool` gained the provided method `schema_is_foreign` (an MCP tool's schema is its server's, so a property `after_previous` in it is kept and is no build error; a wrapper must forward it); `ToolCtx::spend_files_of` takes the room for a result's files by compare-and-swap and drops a file that does not fit; the chart renders `MAX_PARALLEL_TOOL_CALLS` only when `config.maxParallelToolCalls` is set; the prompt prefix changed once (the schemas and one sentence of the instructions). **Folder agents:** the MCP calls of one model reply now overlap (`"parallel": false` per server opts out).
 * **Slices P1 to P4 change no behaviour in production:** every first-party tool is `Alone` until its class is declared, so
   the loop runs one call at a time as before. Tests of the loop with declared test tools prove the rest.
 * The plan for hooks becomes ADR 0050.
@@ -208,9 +206,9 @@ stateDiagram-v2
 | P2 | `ToolAccess`, `Use`, `Tool::access`, `ToolSource::access`, `#[tool(parallel, path, access)]`, `FnTool::with_access`, forwarding in every wrapper | built |
 | P3 | `schedule.rs`: segments, conflicts, barriers, the queue (pure) | built |
 | P4 | `run_pending` by segments, `LlmAgentBuilder::max_parallel` | built |
-| P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | not built |
-| P6 | `after_previous` | not built |
-| P7 | classes of the library tools: MCP, UI, assembly, `read_output` | not built |
+| P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | built |
+| P6 | `after_previous` | built |
+| P7 | classes of the library tools: MCP, UI, assembly, `read_output` | built (`"parallel": false` per server in `mcp.json`; the thread-tools source stays `Alone`; folder agents' MCP calls now overlap) |
 | P8 | the coder: `NotesStore::update`, the class table, atomic writes | not built |
 | P9 | the batching sentence, the bench pin, calls per turn in the bench | not built |
 | P10 | ADR 0037 decision 4 (`waits`, `held`) so subagent and remote calls join segments | later |

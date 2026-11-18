@@ -87,6 +87,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
+  max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -800,7 +801,7 @@ stateDiagram-v2
 
 ### Timeouts, instructions and prompts
 
-Four optional keys of a server entry, in `mcp.json` and in the deployment's extra file
+Five optional keys of a server entry, in `mcp.json` and in the deployment's extra file
 (`ADAM_EXTRA_MCP_FILE`).
 
 | Key | Meaning | Default |
@@ -809,6 +810,7 @@ Four optional keys of a server entry, in `mcp.json` and in the deployment's extr
 | `connectTimeoutSecs` | how long the server may take to start, initialize and list its tools and its prompts: one deadline for all of it | 30 |
 | `instructions` | `false` leaves out the text the server returns when it initializes | on |
 | `prompts` | `false` stops the server's prompts from becoming commands | on |
+| `parallel` | `false` makes the calls of this server's tools run one at a time, alone in their turn; by default they run at the same time as the turn's other calls, up to `MAX_PARALLEL_TOOL_CALLS` ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). **Folder agents change behaviour here:** MCP tools now run at the same time by default; a server with a session (a browser, a cursor, a file being written then read) needs `"parallel": false` in mcp.json before you take this revision. | on |
 
 * **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
   when the file is loaded (`path: error: ...`).

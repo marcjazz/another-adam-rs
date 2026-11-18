@@ -238,6 +238,8 @@ pub struct CoderSettings {
     pub language_server_idle: Duration,
     /// The most language servers this worker holds at once, for every run (`LANGUAGE_SERVERS_MAX`).
     pub language_servers_max: usize,
+    /// The most tool calls of one model turn that run at once (`MAX_PARALLEL_TOOL_CALLS`, 1 to 32).
+    pub max_parallel_tool_calls: usize,
 }
 
 impl Default for CoderSettings {
@@ -287,6 +289,7 @@ impl CoderSettings {
             language_servers: true,
             language_server_idle: Duration::from_secs(600),
             language_servers_max: 4,
+            max_parallel_tool_calls: adam_llm_agent::DEFAULT_MAX_PARALLEL,
         }
     }
 }
@@ -1087,6 +1090,10 @@ impl Tool for Gated {
         self.inner.access(args)
     }
 
+    fn schema_is_foreign(&self) -> bool {
+        self.inner.schema_is_foreign()
+    }
+
     fn read_answer(
         &self,
         call_id: &str,
@@ -1258,6 +1265,10 @@ impl Tool for Redacting {
 
     fn access(&self, args: &Value) -> ToolAccess {
         self.inner.access(args)
+    }
+
+    fn schema_is_foreign(&self) -> bool {
+        self.inner.schema_is_foreign()
     }
 
     fn time_limit(&self) -> Option<Duration> {
@@ -1848,5 +1859,50 @@ mod access_forwarding_tests {
             tool.access(&serde_json::json!({"path": "src/a.rs"})),
             ToolAccess::reads("files/src/a.rs")
         );
+    }
+
+    /// An MCP server's tool, whose schema is the server's.
+    struct Foreign;
+
+    #[async_trait::async_trait]
+    impl Tool for Foreign {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "browse".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"after_previous": {"type": "string"}}
+                }),
+            }
+        }
+
+        fn schema_is_foreign(&self) -> bool {
+            true
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    /// Both layers say what the tool says about its schema: a layer that did not would make an MCP
+    /// tool with its own `after_previous` a build error of the coder (ADR 0049).
+    #[test]
+    fn gated_and_redacting_forward_a_foreign_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let gated = Gated::layer(env)(Arc::new(Foreign));
+        assert!(gated.schema_is_foreign(), "Gated");
+        let redacting = Redacting::layer(Redactor::new(["secret-value-0123456789"]))(gated);
+        assert!(redacting.schema_is_foreign(), "Redacting over Gated");
     }
 }

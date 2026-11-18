@@ -2139,6 +2139,7 @@ way; every problem is reported at once at startup):
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
+| `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (else exit 78): the agent's `LlmAgentBuilder::max_parallel`. Which calls may overlap is each tool's declaration (ADR 0049) | `10` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart (at least 1) | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`): the time limit is also **the most a call's `timeout` may ask for**; the output size is what is shown of a long output, a quarter of it the head and the rest the tail (the whole is kept) | `900`, `16384` |
@@ -2705,7 +2706,8 @@ database of its own, so the role needs `CREATEDB`):
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
   line, exit 69, nothing on stderr, no password, no panic; sqlx retries the
   connection for its 30 s acquire timeout first); with Postgres: the card and
-  `/healthz`, a clean exit 0 on SIGTERM, and
+  `/healthz`, a clean exit 0 on SIGTERM, `MAX_PARALLEL_TOOL_CALLS` at 1 and at 2 read in the model's request (the
+  `after_previous` property and sentence absent and present), and
   SIGTERM in the middle of a check (the process waits for the step,
   commits it, exits 0; a second process over the same database and workspace
   finishes the run with one commit, one push and one pull request). The last
