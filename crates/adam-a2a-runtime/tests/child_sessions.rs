@@ -101,6 +101,8 @@ struct Options {
     hold_helper_on: Option<usize>,
     max_open: u32,
     tiers: bool,
+    listing_page: usize,
+    max_rounds: u32,
 }
 
 impl Options {
@@ -109,6 +111,8 @@ impl Options {
             hold_helper_on: None,
             max_open: 16,
             tiers: false,
+            listing_page: 100,
+            max_rounds: 20,
         }
     }
 }
@@ -150,15 +154,12 @@ impl Rig {
             .poll_interval(Duration::from_millis(10))
             .build();
         let sessions = ChildSessions::new(
-            [ChildSessionAgent {
-                name: "planner".into(),
-                agent: helper.clone(),
-                description: "Plans.".into(),
-                within: None,
-            }],
+            [ChildSessionAgent::new("planner", helper.clone(), "Plans.")],
             options.max_open,
         )
-        .unwrap();
+        .unwrap()
+        .with_listing_page(options.listing_page)
+        .with_max_rounds(options.max_rounds);
         let mut backend = RuntimeTaskBackend::new(runtime.clone(), events, parent)
             .with_poll_interval(Duration::from_millis(10))
             .with_child_sessions(sessions);
@@ -883,6 +884,148 @@ async fn a_round_a_person_starts_runs_under_a_tier() {
         )]));
         let two = rig.submit(&with_tiers, named, None).await.unwrap();
         assert_eq!(said_tier(&two), Some(json!("plan")));
+        rig.stop().await;
+    }
+}
+
+/// `maxOpen` counts every open session, not the first page of the listing: with a page of two, a
+/// closed session and three open ones, a fourth start is refused. (The closed one does not count.)
+#[tokio::test]
+async fn max_open_counts_across_pages() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                max_open: 3,
+                listing_page: 2,
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("closed one");
+        let closed = rig.start(&alice(), Some("ctx-p"), "c", false).await;
+        rig.until(&alice(), &closed.id, TaskState::Completed).await;
+        for n in 0..3 {
+            rig.helper_mock.push_text(format!("open {n}"));
+            let open = rig
+                .start(&alice(), Some("ctx-p"), &format!("o{n}"), true)
+                .await;
+            rig.until(&alice(), &open.id, TaskState::Completed).await;
+        }
+        let mut message = said("one too many", Some("ctx-p"));
+        message.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d", "keepOpen": true}}),
+        )]));
+        assert!(unsupported(rig.submit(&alice(), message, None).await));
+        rig.stop().await;
+    }
+}
+
+/// The refusals of a close, a start in a child context and the rounds limit; and a close is
+/// allowed at the limit.
+#[tokio::test]
+async fn the_other_refusals_and_a_close_at_the_round_limit() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                max_rounds: 2,
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a").push_text("b");
+        let one = rig.start(&alice(), Some("ctx-q"), "one", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+
+        // A start together with a close.
+        let mut both = said("x", Some("ctx-q"));
+        both.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d"}, "close": {}}),
+        )]));
+        assert!(invalid(rig.submit(&alice(), both, None).await));
+        // A close that names a taskId, and a close to the parent context.
+        assert!(invalid(
+            rig.submit(
+                &alice(),
+                close_message(&one.context_id, false),
+                Some(&one.id)
+            )
+            .await
+        ));
+        assert!(invalid(
+            rig.submit(&alice(), close_message("ctx-q", false), None)
+                .await
+        ));
+        // A start in a child context.
+        let mut start = said("x", Some(&one.context_id));
+        start.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d"}}),
+        )]));
+        assert!(invalid(rig.submit(&alice(), start, None).await));
+        // ListTasks on a context nested too deep is an empty page.
+        let deeper = adam_runtime::session_conversation_id(&one.context_id, RunId::new());
+        let mut query = TaskQuery::new();
+        query.context_id = Some(deeper);
+        assert!(
+            rig.backend
+                .list(&alice(), &query)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+
+        // Round 2 is the last: a third message is refused, a close is not.
+        let two = rig
+            .submit(&alice(), said("two", Some(&one.context_id)), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &two.id, TaskState::Completed).await;
+        assert!(unsupported(
+            rig.submit(&alice(), said("three", Some(&one.context_id)), None)
+                .await
+        ));
+        let closed = rig
+            .submit(&alice(), close_message(&one.context_id, false), None)
+            .await
+            .unwrap();
+        assert_eq!(object(&closed)["state"], "closed");
+        rig.stop().await;
+    }
+}
+
+/// A session an embedder made with no header is continued with the contract's default, which is
+/// not to keep it open: the next round closes it when it ends.
+#[tokio::test]
+async fn a_session_with_no_header_is_continued_as_not_kept_open() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock.push_text("a").push_text("b");
+        let session = RunId::new();
+        let conversation = adam_runtime::session_conversation_id("alice:ctx-h", session);
+        rig.runtime
+            .start_child_continuing(
+                session,
+                session,
+                &rig.helper,
+                adam_runtime::Inbound::new("message", json!({"text": "one"})),
+                &conversation,
+                None,
+            )
+            .await
+            .unwrap();
+        let child = adam_runtime::session_conversation_id("ctx-h", session);
+        rig.until(&alice(), &session.to_string(), TaskState::Completed)
+            .await;
+        let two = rig
+            .submit(&alice(), said("two", Some(&child)), None)
+            .await
+            .unwrap();
+        assert_eq!(object(&two)["keepOpen"], false);
+        let done = rig.until(&alice(), &two.id, TaskState::Completed).await;
+        assert_eq!(object(&done)["state"], "closed");
         rig.stop().await;
     }
 }

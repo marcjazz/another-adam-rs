@@ -59,21 +59,20 @@ use crate::task_state;
 /// The most characters of a session's description (the contract's bound).
 pub const MAX_DESCRIPTION_CHARS: usize = 80;
 
-/// The most rounds a session may have, a close included.
+/// The most rounds a session may have before a message to it is refused. A close is always
+/// allowed, even at the limit, so a person can always end a session.
 pub const MAX_SESSION_ROUNDS: u32 = 20;
 
 /// The most sessions the parent task's object lists once the open ones are in: closed sessions,
 /// most recently updated first.
 const CLOSED_LISTED: usize = 16;
 
-/// The most pages of the session listing one parent object reads.
-const MAX_LISTING_PAGES: usize = 8;
-
 /// How many times a request that finds its session changing under it looks again.
 const ATTEMPTS: usize = 3;
 
 /// One helper a person may start a session with.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChildSessionAgent {
     /// The name the card lists and a `start` names.
     pub name: String,
@@ -85,12 +84,37 @@ pub struct ChildSessionAgent {
     pub within: Option<Duration>,
 }
 
+impl ChildSessionAgent {
+    /// A helper listed as `name` whose runs are registered as `agent`, with no time limit.
+    pub fn new(
+        name: impl Into<String>,
+        agent: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            agent: agent.into(),
+            description: description.into(),
+            within: None,
+        }
+    }
+
+    /// The time limit of each of its rounds.
+    #[must_use]
+    pub fn within(mut self, within: Duration) -> Self {
+        self.within = Some(within);
+        self
+    }
+}
+
 /// The helpers an agent serves `child-sessions/v1` for, and its limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChildSessions {
     agents: Vec<ChildSessionAgent>,
     max_open: u32,
     max_rounds: u32,
+    listing_page: usize,
 }
 
 impl ChildSessions {
@@ -127,7 +151,17 @@ impl ChildSessions {
             agents,
             max_open,
             max_rounds: MAX_SESSION_ROUNDS,
+            listing_page: MAX_SESSION_PAGE,
         })
+    }
+
+    /// How many sessions one read of the listing asks for (default 100, the most the runtime
+    /// gives). Smaller only to test paging.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_listing_page(mut self, page: usize) -> Self {
+        self.listing_page = page.clamp(1, MAX_SESSION_PAGE);
+        self
     }
 
     /// The most rounds a session may have (default [`MAX_SESSION_ROUNDS`]), at least 2.
@@ -142,10 +176,7 @@ impl ChildSessions {
         let listed: Vec<_> = self
             .agents
             .iter()
-            .map(|a| ChildSessionInfo {
-                name: a.name.clone(),
-                description: a.description.clone(),
-            })
+            .map(|a| ChildSessionInfo::new(a.name.clone(), a.description.clone()))
             .collect();
         ExtensionConfig::child_sessions(&listed, self.max_open)
     }
@@ -336,6 +367,17 @@ pub(crate) fn wire_state(state: SessionState, latest_closes: bool) -> &'static s
     }
 }
 
+/// The sessions a parent object lists: those not closed on the wire (working, idle, or a round
+/// still ending after a close), then the most recent [`CLOSED_LISTED`] closed ones. The input is
+/// in the runtime's order, so closed ones are already newest first.
+fn select_listed(listed: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    let (mut open, closed): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .partition(|s| wire_state(s.state, s.closing) != "closed");
+    open.extend(closed.into_iter().take(CLOSED_LISTED));
+    open
+}
+
 fn a2a_state_word(state: &TaskState) -> Value {
     serde_json::to_value(state).unwrap_or(Value::Null)
 }
@@ -461,7 +503,7 @@ impl RuntimeTaskBackend {
             "parentContextId": round.parent_context,
             "agent": name,
             "description": latest.map_or("", |h| h.description.as_str()),
-            "keepOpen": latest.is_none_or(|h| h.keep_open),
+            "keepOpen": latest.is_some_and(|h| h.keep_open),
             "round": number,
             "by": if round.by_person { "person" } else { "agent" },
             "state": wire_state(session.state, latest.is_some_and(|h| h.closing)),
@@ -481,7 +523,10 @@ impl RuntimeTaskBackend {
             return Ok(task);
         }
         let entry = match kind_of(&task.context_id) {
-            ContextKind::Root => self.sessions_object(caller, &task.context_id).await,
+            ContextKind::Root => match self.sessions_object(caller, &task.context_id).await {
+                Some(entry) => entry,
+                None => return Ok(task),
+            },
             ContextKind::Child(parent, session) => {
                 let Some(round) = self.round_of(caller, &task.id).await? else {
                     return Ok(task);
@@ -500,30 +545,38 @@ impl RuntimeTaskBackend {
     }
 
     /// The sessions of the parent context `context`, open first, then the most recently closed.
-    pub(crate) async fn sessions_object(&self, caller: &Caller, context: &str) -> Value {
-        let listed = match self.list_all_sessions(caller, context).await {
+    /// `None` when they could not be listed: a task then says nothing, never "no sessions".
+    pub(crate) async fn sessions_object(&self, caller: &Caller, context: &str) -> Option<Value> {
+        // The listing ranks working, then idle, then closed sessions (newest first within each),
+        // so reading pages until 16 closed ones are in hand has every open session and the 16
+        // most recently closed: only closed sessions are ever left unread.
+        let enough = |all: &[SessionSummary]| {
+            all.iter()
+                .filter(|s| s.state == SessionState::Closed)
+                .count()
+                >= CLOSED_LISTED
+        };
+        let listed = match self.list_pages(caller, context, enough).await {
             Ok(listed) => listed,
             Err(e) => {
                 tracing::warn!(error = %e, "the sessions of a context could not be listed");
-                return json!({ "sessions": [] });
+                return None;
             }
         };
-        let (mut open, mut closed): (Vec<_>, Vec<_>) = listed
-            .into_iter()
-            .partition(|s| !s.closed && s.state != SessionState::Closed);
-        closed.truncate(CLOSED_LISTED);
-        open.append(&mut closed);
-        let mut out = Vec::with_capacity(open.len());
-        for s in &open {
+        let mut out = Vec::new();
+        for s in &select_listed(listed) {
             out.push(self.summary_object(context, s).await);
         }
-        json!({ "sessions": out })
+        Some(json!({ "sessions": out }))
     }
 
-    async fn list_all_sessions(
+    /// The sessions of `context` page by page, until `enough` says what is read will do or none
+    /// are left.
+    async fn list_pages(
         &self,
         caller: &Caller,
         context: &str,
+        enough: impl Fn(&[SessionSummary]) -> bool,
     ) -> Result<Vec<SessionSummary>, RuntimeError> {
         let Some(sessions) = &self.child_sessions else {
             return Ok(Vec::new());
@@ -531,18 +584,17 @@ impl RuntimeTaskBackend {
         let parent = parent_conversation(&caller.subject, context);
         let names = sessions.registered();
         let mut all: Vec<SessionSummary> = Vec::new();
-        for _ in 0..MAX_LISTING_PAGES {
+        loop {
             let page = self
                 .runtime
-                .list_sessions(&parent, &names, all.len(), MAX_SESSION_PAGE)
+                .list_sessions(&parent, &names, all.len(), sessions.listing_page)
                 .await?;
-            let short = page.sessions.is_empty();
+            let empty = page.sessions.is_empty();
             all.extend(page.sessions);
-            if short || all.len() >= page.total {
-                break;
+            if empty || all.len() >= page.total || enough(&all) {
+                return Ok(all);
             }
         }
-        Ok(all)
     }
 
     async fn summary_object(&self, context: &str, s: &SessionSummary) -> Value {
@@ -756,9 +808,18 @@ impl RuntimeTaskBackend {
         if let Some(existing) = self.session_of(caller, &context, session).await? {
             return self.answer_round(caller, &existing.latest_run).await;
         }
+        // Every open session counts, not the first page's: the listing puts the open ones first,
+        // so reading until a closed one shows (or `maxOpen` is reached) sees them all. Checked
+        // before the start, so two concurrent starts may both pass and exceed `maxOpen` by the
+        // number racing, as the model's start tool does.
+        let max_open = sessions.max_open as usize;
+        let is_open = |s: &SessionSummary| !s.closed || s.state == SessionState::Working;
+        let enough = |all: &[SessionSummary]| {
+            all.iter().filter(|s| is_open(s)).count() >= max_open
+                || all.iter().any(|s| s.state == SessionState::Closed)
+        };
         let listed = self
-            .runtime
-            .list_sessions(&parent, &sessions.registered(), 0, MAX_SESSION_PAGE)
+            .list_pages(caller, &context, enough)
             .await
             .map_err(|e| match e {
                 RuntimeError::TooManyRounds { .. } => BackendError::UnsupportedOperation(
@@ -766,17 +827,9 @@ impl RuntimeTaskBackend {
                 ),
                 other => map_err(other),
             })?;
-        let open = listed
-            .sessions
-            .iter()
-            .filter(|s| !s.closed || s.state == SessionState::Working)
-            .count();
-        if open >= sessions.max_open as usize
-            || (listed.total > MAX_SESSION_PAGE && open >= MAX_SESSION_PAGE)
-        {
+        if listed.iter().filter(|s| is_open(s)).count() >= max_open {
             return Err(BackendError::UnsupportedOperation(format!(
-                "this context already has {} sessions open; close one first",
-                sessions.max_open
+                "this context already has {max_open} sessions open; close one first"
             )));
         }
         let header = SessionHeader {
@@ -1007,7 +1060,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         id: session,
         agent: view.agent.clone(),
         description: String::new(),
-        keep_open: true,
+        keep_open: false,
         closed: false,
         closing: false,
         round: 0,
@@ -1158,6 +1211,8 @@ mod tests {
             json!({"start": {"agent": "planner"}}),
             json!({"start": {"agent": "planner", "description": "  "}}),
             json!({"start": {"agent": "planner", "description": "a\nb"}}),
+            json!({"start": {"agent": "planner", "description": "a\u{7}b"}}),
+            json!({"start": {"agent": "planner", "description": "a\tb"}}),
             json!({"start": {"agent": "planner", "description": long}}),
             json!({"start": {"agent": "planner", "description": "d", "keepOpen": "yes"}}),
             json!({"start": {"agent": "planner", "description": "d"}, "close": {}}),
@@ -1196,6 +1251,40 @@ mod tests {
         for entry in [json!({"close": true}), json!({"close": {"cancel": "yes"}})] {
             assert!(asked(&message(Some(entry)), &s).is_err());
         }
+    }
+
+    fn summary(state: SessionState, closed: bool, closing: bool, age: i64) -> SessionSummary {
+        SessionSummary {
+            id: RunId::new(),
+            agent: "root/planner".into(),
+            conversation_id: String::new(),
+            latest_run: RunId::new(),
+            round: 1,
+            state,
+            outcome: None,
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age),
+            description: String::new(),
+            keep_open: true,
+            closed,
+            closing,
+            started_by: None,
+        }
+    }
+
+    #[test]
+    fn a_working_session_with_a_close_pending_is_never_cut_with_the_closed_ones() {
+        // Runtime order: working, then idle, then closed newest first.
+        let pending = summary(SessionState::Working, true, false, 1);
+        let mut listed = vec![
+            pending.clone(),
+            summary(SessionState::Idle, false, false, 2),
+        ];
+        listed.extend((0..20).map(|n| summary(SessionState::Closed, true, false, 10 + n)));
+        let kept = select_listed(listed);
+        assert_eq!(kept.len(), 2 + CLOSED_LISTED);
+        assert!(kept.iter().any(|s| s.id == pending.id));
+        assert_eq!(wire_state(kept[0].state, kept[0].closing), "working");
+        assert!(kept[2..].iter().all(|s| s.state == SessionState::Closed));
     }
 
     #[test]

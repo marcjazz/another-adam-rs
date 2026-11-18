@@ -108,11 +108,22 @@ pub const CHILD_SESSIONS_EXTENSION: &str =
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChildSessionInfo {
     /// The name a `start` names.
     pub name: String,
     /// What the helper does, for a person to read.
     pub description: String,
+}
+
+impl ChildSessionInfo {
+    /// A helper `name` with its `description`.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
 }
 
 /// One command of the card's `commands/v1` entry.

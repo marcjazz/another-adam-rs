@@ -84,8 +84,8 @@ impl RuntimeTaskBackend {
             // The tasks of one parent context all say the same sessions.
             if let Some(context) = query.context_id.as_deref()
                 && self.sessions_activated(caller)
+                && let Some(entry) = self.sessions_object(caller, context).await
             {
-                let entry = self.sessions_object(caller, context).await;
                 for task in &mut page.tasks {
                     task.metadata
                         .get_or_insert_with(Default::default)
