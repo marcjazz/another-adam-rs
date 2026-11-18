@@ -26,6 +26,7 @@ use adam_model::{
 };
 use adam_runtime::{BroadcastSink, Runtime, parse_session_conversation_id};
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
@@ -92,6 +93,8 @@ struct Rig {
     backend: RuntimeTaskBackend,
     parent_mock: Arc<MockModel>,
     helper_mock: Arc<MockModel>,
+    hidden_mock: Arc<MockModel>,
+    hidden: String,
     gate: Arc<Gate>,
     helper: String,
     worker: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
@@ -127,6 +130,8 @@ impl Rig {
         let helper = uniq("helper");
         let parent_mock = Arc::new(MockModel::new());
         let helper_mock = Arc::new(MockModel::new());
+        let hidden = uniq("hidden");
+        let hidden_mock = Arc::new(MockModel::new());
         let gate = Arc::new(Gate::default());
         let helper_model: DynModel = Arc::new(GateModel {
             inner: helper_mock.clone(),
@@ -134,15 +139,25 @@ impl Rig {
             hold_on: options.hold_helper_on,
             gate: gate.clone(),
         });
-        let tools = SessionTools::new([SessionAgent {
-            name: "helper".into(),
-            agent: helper.clone(),
-            description: "Does a piece of work.".into(),
-            within: None,
-            remote: false,
-        }]);
+        let tools = SessionTools::new([
+            SessionAgent {
+                name: "helper".into(),
+                agent: helper.clone(),
+                description: "Does a piece of work.".into(),
+                within: None,
+                remote: false,
+            },
+            // A helper the model may start but the card does not list.
+            SessionAgent {
+                name: "hidden".into(),
+                agent: hidden.clone(),
+                description: "Not on the card.".into(),
+                within: None,
+                remote: false,
+            },
+        ]);
         let mut parent_agent = LlmAgent::builder(&parent, parent_mock.clone() as DynModel, "m")
-            .session_agents([helper.clone()]);
+            .session_agents([helper.clone(), hidden.clone()]);
         for tool in tools.tools() {
             parent_agent = parent_agent.dyn_tool(tool);
         }
@@ -150,6 +165,7 @@ impl Rig {
         let runtime = Runtime::builder(store.clone())
             .agent(parent_agent.build())
             .agent(LlmAgent::builder(&helper, helper_model, "m").build())
+            .agent(LlmAgent::builder(&hidden, hidden_mock.clone() as DynModel, "m").build())
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
             .build();
@@ -183,6 +199,8 @@ impl Rig {
             backend,
             parent_mock,
             helper_mock,
+            hidden_mock,
+            hidden,
             gate,
             helper,
             worker: Some((stop, handle)),
@@ -1026,6 +1044,142 @@ async fn a_session_with_no_header_is_continued_as_not_kept_open() {
         assert_eq!(object(&two)["keepOpen"], false);
         let done = rig.until(&alice(), &two.id, TaskState::Completed).await;
         assert_eq!(object(&done)["state"], "closed");
+        rig.stop().await;
+    }
+}
+
+/// Once the closing round has ended its session is closed and not `closing`: that word is for a
+/// session that is closed while a round still works.
+#[tokio::test]
+async fn a_closed_idle_session_does_not_say_closing() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock.push_text("answer");
+        let one = rig.start(&alice(), None, "work", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        let closed = rig
+            .submit(&alice(), close_message(&one.context_id, false), None)
+            .await
+            .unwrap();
+        let ended = rig.until(&alice(), &closed.id, TaskState::Completed).await;
+        assert_eq!(object(&ended)["state"], "closed");
+        assert_eq!(object(&ended)["closing"], false);
+        rig.stop().await;
+    }
+}
+
+/// A session asked to close while its round works still counts against `maxOpen` until the round
+/// ends; a second close with `cancel` then stops the round.
+#[tokio::test]
+async fn a_closing_session_counts_open_and_a_later_cancel_close_stops_its_round() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(0),
+                max_open: 1,
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("never").push_text("other");
+        let one = rig.start(&alice(), Some("ctx-c"), "work", true).await;
+        rig.gate.reached.notified().await;
+        let asked = rig
+            .submit(&alice(), close_message(&one.context_id, false), None)
+            .await
+            .unwrap();
+        assert_eq!(object(&asked)["closing"], true);
+
+        let mut second = said("another", Some("ctx-c"));
+        second.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d", "keepOpen": true}}),
+        )]));
+        assert!(
+            unsupported(rig.submit(&alice(), second, None).await),
+            "a session that is closing but still working is open"
+        );
+
+        // A repeated plain close changes nothing; a close with cancel stops the round.
+        let again = rig
+            .submit(&alice(), close_message(&one.context_id, false), None)
+            .await
+            .unwrap();
+        assert_eq!(again.id, one.id);
+        let canceled = rig
+            .submit(&alice(), close_message(&one.context_id, true), None)
+            .await
+            .unwrap();
+        assert_eq!(canceled.id, one.id);
+        let old = rig.task(&alice(), &one.id).await;
+        assert_eq!(old.status.state, TaskState::Canceled);
+        rig.gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// A session the model starts with a helper the card does not list is not reachable as a task or
+/// a session through this extension.
+#[tokio::test]
+async fn a_round_of_a_helper_the_card_does_not_list_is_not_found() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.hidden_mock.push_text("hidden answer");
+        rig.parent_mock
+            .push_tool_calls(vec![ToolCall::new(
+                "c1",
+                "subagent_start",
+                json!({"agent": "hidden", "description": "look", "prompt": "go", "keep_open": true}),
+            )])
+            .push_text("started")
+            .push_text("digested");
+        let parent = rig
+            .submit(&alice(), said("start one", Some("ctx-h")), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &parent.id, TaskState::Completed).await;
+        let query = adam_core::RunQuery::new(
+            rig.hidden.clone(),
+            adam_core::ConversationScope::Prefix(String::new()),
+            10,
+        );
+        let runs = store.list_runs(&query).await.unwrap();
+        assert_eq!(runs.len(), 1, "the model started the hidden helper");
+        let id = runs[0].id.to_string();
+        assert!(rig.backend.get(&alice(), &id).await.unwrap().is_none());
+        assert!(matches!(
+            rig.backend.cancel(&alice(), &id).await,
+            Err(BackendError::TaskNotFound(_))
+        ));
+        rig.stop().await;
+    }
+}
+
+/// The first event of a subscription says the sessions of a parent task and the session of a round.
+#[tokio::test]
+async fn a_subscription_snapshot_says_the_sessions() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock.push_text("a");
+        let one = rig.start(&alice(), Some("ctx-s"), "one", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        rig.parent_mock.push_text("parent says");
+        let parent = rig
+            .submit(&alice(), said("hello", Some("ctx-s")), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &parent.id, TaskState::Completed).await;
+
+        let snapshot = |event: Option<Result<adam_a2a::TaskEvent, BackendError>>| match event {
+            Some(Ok(adam_a2a::TaskEvent::Snapshot(task))) => task,
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+        let mut events = rig.backend.subscribe(&alice(), &parent.id);
+        let task = snapshot(events.next().await);
+        assert_eq!(object(&task)["sessions"].as_array().map(Vec::len), Some(1));
+        let mut events = rig.backend.subscribe(&alice(), &one.id);
+        let task = snapshot(events.next().await);
+        assert_eq!(object(&task)["session"], one.id);
         rig.stop().await;
     }
 }
