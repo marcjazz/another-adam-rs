@@ -445,6 +445,7 @@ The servers are a **closed table in code** (`table.rs`, never a setting, so a de
 | `.ts .tsx .mts .cts .js .jsx .mjs .cjs` | `typescript-language-server --stdio` (the image's TypeScript, no automatic type acquisition) | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | `.py .pyi` | `pyright-langserver --stdio` (on Node: it sees no interpreter and no installed package) | `pyrightconfig.json`, `pyproject.toml`, `setup.cfg`, `setup.py` |
 | `.go` | `gopls serve` (`GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=local`) | `go.work`, `go.mod` |
+| `.dart` | `dart language-server --protocol=lsp` | `pubspec.yaml` |
 
 The root is the nearest directory, from the file's own up to the slot's root, that holds one of the markers; the slot's root
 when none does. **Today's coder image has no language server**: it is built on a workspace image from before the

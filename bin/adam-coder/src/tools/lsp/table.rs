@@ -38,11 +38,19 @@ pub enum Language {
     Python,
     /// Go: `gopls`.
     Go,
+    /// Dart: `dart language-server`.
+    Dart,
 }
 
 impl Language {
     /// Every language, in the order the table lists them.
-    pub const ALL: [Self; 4] = [Self::Rust, Self::TypeScript, Self::Python, Self::Go];
+    pub const ALL: [Self; 5] = [
+        Self::Rust,
+        Self::TypeScript,
+        Self::Python,
+        Self::Go,
+        Self::Dart,
+    ];
 
     /// The language of a file, and the `languageId` its text document is opened with.
     pub fn of_path(path: &str) -> Option<(Self, &'static str)> {
@@ -56,6 +64,7 @@ impl Language {
             "jsx" => (Self::TypeScript, "javascriptreact"),
             "py" | "pyi" => (Self::Python, "python"),
             "go" => (Self::Go, "go"),
+            "dart" => (Self::Dart, "dart"),
             _ => return None,
         })
     }
@@ -67,6 +76,7 @@ impl Language {
             Self::TypeScript => "TypeScript",
             Self::Python => "Python",
             Self::Go => "Go",
+            Self::Dart => "Dart",
         }
     }
 
@@ -77,6 +87,7 @@ impl Language {
             Self::TypeScript => &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
             Self::Python => &["py", "pyi"],
             Self::Go => &["go"],
+            Self::Dart => &["dart"],
         }
     }
 
@@ -92,6 +103,7 @@ impl Language {
                 "setup.py",
             ],
             Self::Go => &["go.work", "go.mod"],
+            Self::Dart => &["pubspec.yaml"],
         }
     }
 
@@ -139,6 +151,10 @@ impl Language {
                     options,
                 }
             }
+            Self::Dart => Settings {
+                sections: json!({}),
+                options: json!({}),
+            },
         }
     }
 }
@@ -189,12 +205,12 @@ pub struct ServerSpec {
 /// The servers, by language.
 #[derive(Debug, Clone)]
 pub struct ServerTable {
-    entries: [ServerSpec; 4],
+    entries: [ServerSpec; 5],
 }
 
 impl ServerTable {
     /// The servers of the images (`rust-analyzer`, `typescript-language-server --stdio`,
-    /// `pyright-langserver --stdio`, `gopls serve`).
+    /// `pyright-langserver --stdio`, `gopls serve`, `dart language-server --protocol=lsp`).
     pub fn production() -> Self {
         let spec =
             |program: &str, launch: &str, version_probe: bool, env: &[(&str, &str)]| ServerSpec {
@@ -231,6 +247,12 @@ impl ServerTable {
                     false,
                     &[("GOFLAGS", "-mod=readonly"), ("GOTOOLCHAIN", "local")],
                 ),
+                spec(
+                    "dart",
+                    "exec dart language-server --protocol=lsp",
+                    false,
+                    &[],
+                ),
             ],
         }
     }
@@ -253,6 +275,7 @@ impl ServerTable {
             Language::TypeScript => 1,
             Language::Python => 2,
             Language::Go => 3,
+            Language::Dart => 4,
         }
     }
 }
@@ -278,6 +301,7 @@ mod tests {
         assert_eq!(id("x.mjs"), Some((Language::TypeScript, "javascript")));
         assert_eq!(id("m.pyi"), Some((Language::Python, "python")));
         assert_eq!(id("cmd/x.go"), Some((Language::Go, "go")));
+        assert_eq!(id("lib/main.dart"), Some((Language::Dart, "dart")));
         // A directory called `x.rs` is not the extension of the file in it.
         for none in ["README.md", "Makefile", "dir.rs/file", "noext"] {
             assert_eq!(id(none), None, "{none}");
@@ -314,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_names_four_servers_and_a_test_can_replace_one() {
+    fn the_table_names_five_servers_and_a_test_can_replace_one() {
         let table = ServerTable::production();
         let programs: Vec<&str> = Language::ALL
             .iter()
@@ -326,7 +350,8 @@ mod tests {
                 "rust-analyzer",
                 "typescript-language-server",
                 "pyright-langserver",
-                "gopls"
+                "gopls",
+                "dart",
             ]
         );
         assert!(

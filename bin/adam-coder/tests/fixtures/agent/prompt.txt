@@ -137,7 +137,7 @@ The person watching a turn of yours sees two different things, and each has its 
 - `list_files`, `find_files { pattern }` and `search_files { pattern, include?, literal? }`
   look around in the same pages, git's ignored files left out: use them, not `ls` or `grep -rn`.
 - `file_diagnostics { path }`, `find_definition { path, line, symbol }`, `find_references { path, line, symbol }`:
-  a language server's view (Rust, TypeScript, Python, Go); with none, the answer says so.
+  a language server's view (Rust, TypeScript, Python, Go, Dart); with none, the answer says so.
 - `write_file { path, content, repo? }`: create a file or replace one with exactly `content`
   (parent directories are created). Nothing inside `.git` and nothing through a
   symlink can be written.
