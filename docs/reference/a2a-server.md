@@ -309,6 +309,9 @@ stateDiagram-v2
   [*] --> working: start
   working --> idle: the round ended and the session is kept open
   working --> closed: the round ended and the session is not kept open
+  working --> idle: CancelTask of the round and the session is kept open
+  working --> closed: CancelTask of the round and it is not kept open
+  working --> closed: the round ended after a close (closing)
   working --> closed: a close with cancel
   idle --> working: a message to the child context
   idle --> closed: a close
@@ -326,9 +329,11 @@ stateDiagram-v2
   `ListTasks {contextId: K}` lists the rounds, an unknown or foreign `K` is an empty page.
 * **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
 * **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
-  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. The stream events of the contract
-  (`opened`, `round`, `reported`, `closed`) and the object on a round stream's closing update are slice 6 part b.
-* **Limits.** `maxOpen` (the card's), 20 rounds a session, a description of at most 80 characters on one line. A round a person
+  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. Today only the snapshot of a stream,
+  `GetTask`, `ListTasks` and the answers carry them. Part b (not built) adds the parent stream's events (`opened`, `round`,
+  `reported`, `closed`, with `opened` and `by: person` on a running parent) and the round stream's status updates when a round
+  ends and when `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
+* **Limits.** `maxOpen` (the card's), checked before the start: two concurrent starts may exceed it by the number racing, as the model's start tool may. 20 rounds a session (a close is always allowed, even at the limit), a description of at most 80 characters on one line. A round a person
   starts runs under the tier its message names, else the agent's default; commands are not expanded in a child context.
 
 ## Commands (`commands/v1`)

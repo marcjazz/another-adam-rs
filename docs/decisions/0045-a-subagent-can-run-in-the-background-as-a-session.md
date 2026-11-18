@@ -71,7 +71,7 @@ card yet.
   (`SessionView::started_outside_a_run`) and the A2A front derives `by: person` from it. A round the model starts is unchanged.
 * **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3.
 * **Decision 9**: a round a person starts always has a tier written (the one its message names, else the agent's default).
-* **Decision 5**: the card's `maxOpen` is the constant 16 for now, as the tools' limit; it becomes a setting with slice 4.
+* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' constant (16) until slice 4 makes it a setting. It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
 * **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
   tasks are unsupported.
 
