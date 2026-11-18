@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::access::ToolAccess;
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
@@ -34,10 +35,13 @@ pub const TOOL_STOP_GRACE: Duration = Duration::from_secs(5);
 /// The agent runs every call inside a journaled step: once a call has
 /// returned, its result is recorded and never recomputed, even across a crash
 /// or a change of worker. A call that dies *before* it is recorded (a crash
-/// mid-call, or [`ToolError::Transient`]) runs again, and so does every tool
-/// of the same model turn that ran before it in the failed attempt. A tool
-/// with side effects must therefore be safe to retry: idempotent, or guarded
-/// by a key derived from [`ToolCtx::call_id`].
+/// mid-call, or [`ToolError::Transient`]) runs again, and so does every call
+/// of the same model turn that started in the failed attempt: the calls of a
+/// turn run at the same time, up to the agent's limit
+/// ([`LlmAgentBuilder::max_parallel`](crate::LlmAgentBuilder::max_parallel)), except where
+/// [`access`](Self::access) says they may not. A tool with side effects must
+/// therefore be safe to retry: idempotent, or guarded by a key derived from
+/// [`ToolCtx::call_id`].
 #[async_trait]
 pub trait Tool: Send + Sync + 'static {
     /// Name, description and JSON Schema of the arguments, as shown to the
@@ -115,6 +119,26 @@ pub trait Tool: Send + Sync + 'static {
     /// it forwards [`required_state`](Self::required_state).
     fn step_style(&self) -> StepStyle {
         StepStyle::default()
+    }
+
+    /// What a call with these `args` shares with the other calls of its model turn: the loop runs
+    /// the calls of a turn at the same time and keeps the model's order only between calls that
+    /// conflict ([`ToolAccess`]). `args` are the call's arguments as the model made them, so the
+    /// answer is a function of the recorded turn and the same on every replay.
+    ///
+    /// The default is [`ToolAccess::Alone`]: the call runs by itself, after every call before it,
+    /// which is what a tool that declares nothing needs, because adam cannot know what it shares.
+    /// Declare what the tool really uses (`#[tool(parallel = "read", path = "path")]` writes it
+    /// for a function, [`FnTool::with_access`](crate::FnTool::with_access) for a closure). A tool
+    /// whose [`asks_user`](Self::asks_user) is `true`, the session tools, and a tool that can park
+    /// the run on a child or a remote task run alone whatever they say here.
+    ///
+    /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as
+    /// it forwards [`required_state`](Self::required_state): one that does not makes the tool
+    /// `Alone`, which is safe.
+    fn access(&self, args: &Value) -> ToolAccess {
+        let _ = args;
+        ToolAccess::Alone
     }
 
     /// Whether the answer to this tool's own question may be acted on: the loop asks before it
@@ -393,6 +417,11 @@ pub struct ToolOutput {
     /// the session tools only. Never read from an error result.
     ///
     /// Absent from a journal written before it existed, and not written while empty.
+    ///
+    /// **Honoured only from a tool that runs alone.** The loop reads the rounds in a journaled step of
+    /// its own right after the call; beside other calls (ADR 0049) that step has no place between
+    /// them, so a call of a segment of several that reports rounds is answered with an error that
+    /// tells the model to call the tool alone.
     ///
     /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -728,7 +757,7 @@ pub struct ToolCtx {
     /// it; `None` for the agent's own tools and for a listing that said nothing.
     note: Option<ToolNote>,
     /// The bytes of files the run may still share ([`files_left`](Self::files_left)).
-    files_left: u64,
+    files_left: Arc<std::sync::atomic::AtomicU64>,
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
@@ -791,7 +820,7 @@ impl ToolCtx {
             root_step,
             step,
             note: None,
-            files_left: MAX_RUN_FILE_BYTES as u64,
+            files_left: Arc::new(std::sync::atomic::AtomicU64::new(MAX_RUN_FILE_BYTES as u64)),
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
@@ -812,6 +841,16 @@ impl ToolCtx {
             scope,
             root_run,
         }));
+        self
+    }
+
+    /// Make this call spend the budgets of `first`, a call of the same segment: the room for kept
+    /// outputs, the room for files and the image gate are one for all the calls that run together.
+    #[must_use]
+    pub(crate) fn sharing_budgets_of(mut self, first: &ToolCtx) -> Self {
+        self.kept_left = Arc::clone(&first.kept_left);
+        self.files_left = Arc::clone(&first.files_left);
+        self.images.clone_from(&first.images);
         self
     }
 
@@ -958,7 +997,9 @@ impl ToolCtx {
     /// answers. The agent loop does it for every call.
     #[must_use]
     pub fn with_files_left(mut self, bytes: u64) -> Self {
-        self.files_left = bytes.min(MAX_RUN_FILE_BYTES as u64);
+        self.files_left = Arc::new(std::sync::atomic::AtomicU64::new(
+            bytes.min(MAX_RUN_FILE_BYTES as u64),
+        ));
         self
     }
 
@@ -968,7 +1009,23 @@ impl ToolCtx {
     /// returns files it did not choose (an MCP server's images, a remote agent's file parts) keeps
     /// its result within this, so that one journal entry stays within the run's cap.
     pub fn files_left(&self) -> u64 {
-        self.files_left
+        self.files_left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `bytes` of the room for files are taken: call it when the call decides to return files of
+    /// that size. The calls of one segment that run together share the room, so a call that starts
+    /// after this one reads a smaller [`files_left`](Self::files_left). The loop still refuses, when
+    /// the results are applied, a file that would go over the run's cap.
+    pub fn spend_files(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99.
+        let mut left = self.files_left.load(SeqCst);
+        while let Err(now) =
+            self.files_left
+                .compare_exchange_weak(left, left.saturating_sub(bytes), SeqCst, SeqCst)
+        {
+            left = now;
+        }
     }
 
     /// Give the call the note its source made about the tool when it listed it
@@ -1438,6 +1495,38 @@ mod tests {
             let json = serde_json::to_value(&poll).unwrap();
             assert_eq!(serde_json::from_value::<RemotePoll>(json).unwrap(), poll);
         }
+    }
+
+    #[test]
+    fn the_calls_of_a_segment_spend_one_room_for_kept_outputs_and_one_image_gate() {
+        let sink: DynEventSink = Arc::new(adam_runtime::NoopSink);
+        let limits = adam_model::ImageLimits {
+            max_bytes: 1024,
+            max_count: 4,
+            max_side: 100,
+            sources: std::collections::BTreeSet::from([adam_model::ImageOrigin::Mcp]),
+        };
+        let one = ToolCtx::detached("a", "c1", sink.clone())
+            .with_kept(1000, Arc::default())
+            .with_image_limits(limits);
+        let two = ToolCtx::detached("b", "c2", sink.clone())
+            .with_kept(1000, Arc::default())
+            .sharing_budgets_of(&one);
+        one.spend_kept(300);
+        assert_eq!(
+            two.kept_left(),
+            700,
+            "what one call keeps is gone for the other"
+        );
+        two.spend_kept(500);
+        assert_eq!(one.kept_left(), 200);
+        assert!(two.sees_images(), "the image gate is the first call's");
+        let alone = ToolCtx::detached("c", "c3", sink).with_kept(1000, Arc::default());
+        assert_eq!(
+            alone.kept_left(),
+            1000,
+            "a call outside the segment has its own"
+        );
     }
 
     #[test]

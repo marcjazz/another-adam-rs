@@ -135,6 +135,7 @@
 #[doc(hidden)]
 #[path = "private.rs"]
 pub mod __private;
+mod access;
 mod agent;
 mod compaction;
 mod conversation;
@@ -144,6 +145,7 @@ mod images;
 mod kept;
 pub mod paging;
 mod plan;
+mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
 mod sessions;
@@ -155,9 +157,11 @@ mod tool;
 mod toolset;
 mod typed;
 
+pub use access::{ToolAccess, Use, UseMode, path_scope};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
-    BuildError, CLOSING_TURN, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
+    BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
+    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT,
 };
 pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
 pub use conversation::{
